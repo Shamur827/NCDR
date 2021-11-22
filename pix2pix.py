@@ -94,7 +94,7 @@ class customLoss(nn.Module):
         super(customLoss, self).__init__()
 
     def forward(self, outputs, targets):
-        return torch.mean((outputs - targets) ** 2 * (targets / 20 + 1))
+        return torch.mean((outputs - targets) ** 2 * (targets + 1))
 
 
 class UNetDown(nn.Module):
@@ -372,7 +372,7 @@ class pix2pixModel(object):
         weight = 100
         loss_G = loss_GAN + weight * loss_pixel
         loss_G.backward()
-        # print(self.generator.module.down1_wd.model[0].weight.grad)
+        # print(self.generator.module.down1.model[0].weight)
         self.optimizer_G.step()
 
         #  Train Discriminator
@@ -497,7 +497,7 @@ class pix2pixModel(object):
                     if not os.path.exists(doc):
                         os.mkdir(doc)
                     self.plt_shp(p, doc + "/p" + ".png")
-                    self.writefile(p, doc + "/" + YName[b][-40:-4] + ".txt")
+                    self.writefile(p, doc + "/QPE_" + YName[b][-40:-4] + ".txt")
                     if self.opt.pltSource:
                         for t in X_time:
                             self.pltRadar(t[0], doc)
@@ -536,6 +536,12 @@ class pix2pixModel(object):
             return
         loss_test *= 1000
         # print("DataLoader_test: ", loss_test / len(DataLoader_test))
+
+        def avg_(list, label):
+            if len(list) == 0:
+                return label + "=NaN"
+            return label + "=%.3f" % (sum(list) / len(list))
+
         with open(doc_test + "/cal.txt", "a") as f:
             if sum_csi_or == 0:
                 sum_csi_or = 1
@@ -551,14 +557,16 @@ class pix2pixModel(object):
                 filter(lambda x: list(map(lambda te: float(te) > 1, temp_avg))[temp_mer.index(x)] is True, temp_mer))
             topmer_max = list(
                 filter(lambda x: list(map(lambda te: int(te) >= 40, temp_max))[temp_mer.index(x)] is True, temp_mer))
-            f.writelines("topmer_avg=%.3f, topmer_max=%.3f \n" % (sum(topmer_avg) / len(topmer_avg),
-                                                                  sum(topmer_max) / len(topmer_max)))
+            # f.writelines("topmer_avg=%.3f, topmer_max=%.3f \n" % (sum(topmer_avg) / len(topmer_avg),
+            #                                                       sum(topmer_max) / len(topmer_max)))
+            f.writelines(avg_(topmer_avg, "topmer_avg") + ", " + avg_(topmer_max, "topmer_max") + " \n")
             topmse_avg = list(
                 filter(lambda x: list(map(lambda te: float(te) > 1, temp_avg))[temp_mse.index(x)] is True, temp_mse))
             topmse_max = list(
                 filter(lambda x: list(map(lambda te: int(te) >= 40, temp_max))[temp_mse.index(x)] is True, temp_mse))
-            f.writelines("topmse_avg=%.3f, topmse_max=%.3f \n" % (sum(topmse_avg) / len(topmse_avg),
-                                                                  sum(topmse_max) / len(topmse_max)))
+            # f.writelines("topmse_avg=%.3f, topmse_max=%.3f \n" % (sum(topmse_avg) / len(topmse_avg),
+            #                                                       sum(topmse_max) / len(topmse_max)))
+            f.writelines(avg_(topmse_avg, "topmse_avg") + ", " + avg_(topmse_max, "topmse_max") + " \n")
 
         print("Mean error rate = %.5f " % (sum(temp_mer) / len(temp_mer)) + "%")
         print("Critical Success Index = %.5f " % (sum_csi_and / sum_csi_or))
@@ -945,7 +953,7 @@ def op():
     parser.add_argument("--Threshold", type=int, default=15, help="")
     parser.add_argument("--Threshold_Avg", type=int, default=90, help="")
     parser.add_argument("--CSI_Threshold", type=int, default=10, help="")
-    parser.add_argument("--Train", type=bool, default=True, help="")
+    parser.add_argument("--Train", type=int, default=1, help="1 is Train, 0 is Test")
     parser.add_argument("--TestData", type=str, default="202105", help="")
     parser.add_argument("--pltSource", type=bool, default=False, help="")
     return parser.parse_args()
@@ -958,15 +966,17 @@ def main():
     model = pix2pixModel(opt)
     # model.predict_point(long=120.2420, lat=24.5976, start="2021/05/28 00:00", end="2021/05/31 19:00")
 
-    if opt.Train:
+    if opt.Train == 1:
         X_train, Y_train, X_test, Y_test, X_val, Y_val = CreateDataSet(opt)
         print("train data: ", end="")
         DataLoader_train = DataLoader(NNDataset(X_train, Y_train), batch_size=opt.batch_size_train, num_workers=4)
         print("val data: ", end="")
         DataLoader_val = DataLoader(NNDataset(X_val, Y_val), batch_size=opt.batch_size_val, num_workers=4)
         model.train(DataLoader_train, DataLoader_val)
-    else:
+    elif opt.Train == 0:
         X_test, Y_test = CreateTestData(opt)
+    else:
+        return
     print("test data: ", end="")
     DataLoader_test = DataLoader(NNDataset(X_test, Y_test, True), batch_size=opt.batch_size_test, num_workers=1)
     model.test(DataLoader_test)

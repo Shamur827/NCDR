@@ -2,7 +2,8 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="3645f051-f8ad-4d53-97b6-2ec238f6ab74" name="Default Changelist" comment="">
-      <change afterPath="$PROJECT_DIR$/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pix2pix.py" beforeDir="false" afterPath="$PROJECT_DIR$/pix2pix.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/pix2pix_data.py" beforeDir="false" afterPath="$PROJECT_DIR$/pix2pix_data.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -65,6 +66,7 @@
         </entry>
       </map>
     </option>
+    <option name="oldMeFiltersMigrated" value="true" />
   </component>
   <component name="XDebuggerManager">
     <breakpoint-manager>

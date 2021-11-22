@@ -7,16 +7,16 @@ import array as arr
 
 warnings.filterwarnings('ignore')
 
-SourcePath = r"./RadarData"
-Path_QPE = r"./QPE"
-Path_Pix2pix = r"./QPE/pix2pix"
-Path_shp = r'./RadarData/shp/TWN_CITY.shp'
+# SourcePath = r"./RadarData"
+# Path_QPE = r"./QPE"
+# Path_Pix2pix = r"./QPE/pix2pix"
+# Path_shp = r'./RadarData/shp/TWN_CITY.shp'
 
-# SourcePath = r"E:\TWCC\RadarData"
-# SourcePath = r"D:/Data2"
-# Path_QPE = r"E:\TWCC/QPE"
-# Path_Pix2pix = r"E:\TWCC/QPE/pix2pix"
-# Path_shp = r"E:\TWCC/RadarData/shp/TWN_CITY.shp"
+SourcePath = r"E:\TWCC\RadarData"
+SourcePath = r"D:/Data2"
+Path_QPE = r"E:\TWCC/QPE"
+Path_Pix2pix = r"E:\TWCC/QPE/pix2pix"
+Path_shp = r"E:\TWCC/RadarData/shp/TWN_CITY.shp"
 MaxDR, MinDR, MaxDZ, MinDZ, MaxKD, MinKD, MaxPre, MinPre, MaxZ, MinZ = \
     25.496891, 0.0, 110.35679, -30.603172, 39.522815, 0.0, 99.75, 0.0, 10 ** 11.035679, 10 ** -3.0603172
 MaxWD_u, MinWD_u, MaxWD_v, MinWD_v, MaxWD_w, MinWD_w, = \
@@ -162,10 +162,7 @@ def SourceToNpy(sourPath, Type):
             with open(sourPath, "rb") as f:
                 float_array = arr.array('f')
                 float_array.fromfile(f, 441 * 561 * 34)
-                n = np.array(float_array).reshape(-1)[::-1].reshape(34, 561, 441).transpose(1, 2, 0)
-                # array = n[:, ::-1, -8:]
-                array = n[:, ::-1, :]
-                # n = np.array(float_array).reshape(-1).reshape(34, 561, 441).transpose(1, 2, 0)[::-1, :, :]
+                array = np.array(float_array).reshape(-1).reshape(34, 561, 441).transpose(1, 2, 0)[::-1, :, :]
                 if Type == "DZ":
                     array = np.where(array == -9999, MinDZ, array)
                 else:
@@ -227,7 +224,7 @@ def ProcessNpy(sourPath, Type, dBZtoZ=True):
     def Preprocess(array, Type):
         w = 192
         h = 256
-        array = array[135:-151, 160:-119, -8:]
+        array = array[135:-151, 2/0.0125:-119, :8]
         if Type == "KD":
             array = np.where(array > MaxKD, MaxKD, array)
 
