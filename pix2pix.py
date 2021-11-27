@@ -23,17 +23,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if not torch.cuda.is_available():
     raise Exception("No GPU found, please run without --cuda")
 
-SourcePath = r"./RadarData"
-Path_QPE = r"./QPE"
-Path_Pix2pix = r"./QPE/pix2pix"
-Path_shp = r'./RadarData/shp/TWN_CITY.shp'
-
-
-# SourcePath = r"E:/TWCC/RadarData"
-# SourcePath = r"D:/Data2"
-# Path_QPE = r"E:/TWCC/QPE"
-# Path_Pix2pix = r"E:/TWCC/QPE/pix2pix"
-# Path_shp = r"E:/TWCC/RadarData/shp/TWN_CITY.shp"
+SourcePath = pix2pix_data.SourcePath
+Path_QPE = pix2pix_data.Path_QPE
+Path_Pix2pix = pix2pix_data.Path_Pix2pix
+Path_shp = pix2pix_data.Path_shp
+Region = pix2pix_data.Region
 
 
 class NNDataset(Dataset):
@@ -75,6 +69,13 @@ class NNDataset(Dataset):
             return torch.from_numpy(X_).float(), torch.from_numpy(Y_).float().unsqueeze(0)
 
     def Preprocess(self, array, ci):
+        # print("1:", array.shape)
+        # be_long, be_long2, be_lat, be_lat2 = pix2pix_data.Get_LongLat("Rain")
+        # # ST
+        # af_long, af_long2, af_lat, af_lat2 = pix2pix_data.Get_LongLat("ST")
+        # array = array[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
+        #         round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125), :8]
+        # print("2:", array.shape)
         # wissdom_out_Taiwan_mosaic_202105311730.npy
         if ci[-42:-17] == "wissdom_out_Taiwan_mosaic":
             return array[:, :, ::-1]
@@ -84,7 +85,12 @@ class NNDataset(Dataset):
         if not os.path.exists(Y_path):
             return np.zeros(1)
         array = np.load(Y_path)
-        array = cv2.resize(array, (self.w, self.h))
+        be_long, be_long2, be_lat, be_lat2 = pix2pix_data.Get_LongLat("Rain")
+        # ST
+        af_long, af_long2, af_lat, af_lat2 = pix2pix_data.Get_LongLat(Region)
+        array = array[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
+                round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125)]
+        # array = cv2.resize(array, (self.w, self.h))
         array = np.log2(array + 1) / np.log2(pix2pix_data.MaxPre + 1)
         return array
 
@@ -180,7 +186,7 @@ class GeneratorUNet(nn.Module):
         x0 = F.relu(self.conv_hPA0_2(x0))
         x1 = F.relu(self.conv_hPA1_2(x1))
         x2 = F.relu(self.conv_hPA2_2(x2))
-        x_cat = torch.cat((x0, x1, x2), 1)
+        x_cat = torch.cat((x0, x1, x2), 1)  # torch.Size([7, 24, 64, 64])
         if channel == 24 + 48:
             # x3 = x[:, 24:, :, :].clone()
             x3 = F.relu(self.conv_hPA3(x[:, 24:, :, :]))
@@ -188,18 +194,18 @@ class GeneratorUNet(nn.Module):
             x3 = F.tanh(self.conv_hPA3_3(x3))
             x_cat = F.relu(x_cat + x3)
 
-        d1 = self.down1(x_cat)
-        d2 = self.down2(d1)
-        d3 = self.down3(d2)
-        d4 = self.down4(d3)
-        d5 = self.down5(d4)
-        d6 = self.down6(d5)
-        u1 = self.up1(d6, d5)
-        u2 = self.up2(u1, d4)
-        u3 = self.up3(u2, d3)
-        u4 = self.up4(u3, d2)
-        u5 = self.up5(u4, d1)
-        fin = self.final(u5)
+        d1 = self.down1(x_cat)  # torch.Size([7, 64, 32, 32])
+        d2 = self.down2(d1)     # torch.Size([7, 128, 16, 16])
+        d3 = self.down3(d2)     # torch.Size([7, 256, 8, 8])
+        d4 = self.down4(d3)     # torch.Size([7, 512, 4, 4])
+        d5 = self.down5(d4)     # torch.Size([7, 512, 2, 2])
+        d6 = self.down6(d5)     # torch.Size([7, 512, 1, 1])
+        u1 = self.up1(d6, d5)   # torch.Size([7, 1024, 2, 2])
+        u2 = self.up2(u1, d4)   # torch.Size([7, 1024, 4, 4])
+        u3 = self.up3(u2, d3)   # torch.Size([7, 512, 8, 8])
+        u4 = self.up4(u3, d2)   # torch.Size([7, 256, 16, 16])
+        u5 = self.up5(u4, d1)   # torch.Size([7, 128, 32, 32])
+        fin = self.final(u5)    # torch.Size([7, 1, 64, 64])
 
         return fin
 
@@ -402,11 +408,12 @@ class pix2pixModel(object):
         if self.cmap is None:
             self.pltconfig()
         if not os.path.exists(Path_shp):
-            print("please upload the shp file at ./shp/TWN_CITY.shp")
+            print("please upload the shp file at " + Path_shp)
             return
         TWN_CITY = gpd.read_file(Path_shp)
-        x = np.arange(120, 122.0125, 0.0125)
-        y = np.arange(21.8875, 25.3125, 0.0125)
+        long, long2, lat, lat2 = pix2pix_data.Get_LongLat(Region)
+        x = np.arange(long, long2 + 0.01, 0.0125)
+        y = np.arange(lat, lat2 + 0.01, 0.0125)
         x, y = np.meshgrid(x, y)
 
         fig, ax = plt.subplots()
@@ -414,8 +421,8 @@ class pix2pixModel(object):
         norm = mpl.colors.BoundaryNorm(bounds, self.cmap.N)
         plt.contourf(x, y, img[::-1, :], bounds, cmap=self.cmap)
         ax = TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
-        plt.xlim(120, 122.0125)
-        plt.ylim(21.8875, 25.3125)
+        plt.xlim(long, long2)
+        plt.ylim(lat, lat2)
         plt.xticks(np.arange(120, 122.5, 0.5))
         plt.colorbar(
             mpl.cm.ScalarMappable(cmap=self.cmap, norm=norm),
@@ -430,6 +437,7 @@ class pix2pixModel(object):
         plt.close()
 
     def writefile(self, p, filepath):
+        return
         with open(filepath, "w") as f:
             c = 0
             for i in range(275):
@@ -443,6 +451,10 @@ class pix2pixModel(object):
     def cal_site(self, gt, p):
         threshold = self.threshold
         site = np.load(os.path.join(SourcePath, "site.npy"))
+        be_long, be_long2, be_lat, be_lat2 = pix2pix_data.Get_LongLat("Rain")
+        af_long, af_long2, af_lat, af_lat2 = pix2pix_data.Get_LongLat(Region)
+        site = site[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
+                round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125)]
         gt, p = gt[site == 1], p[site == 1]
 
         mer = 100 * (np.abs(gt - p) / (gt + 1.01)).mean()
@@ -492,7 +504,9 @@ class pix2pixModel(object):
                 loss_test += self.loss(output, test_y.float().to(device)).item()
                 for b in range(test_x.shape[0]):
                     p = output[b, :, :].cpu().numpy().reshape(self.opt.img_height, self.opt.img_width)
-                    p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
+                    # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
+                    p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
+
                     doc = doc_test + "/" + YName[b][-40:-4]  # qpepre_202105010600-202105010700_1_h
                     if not os.path.exists(doc):
                         os.mkdir(doc)
@@ -637,78 +651,79 @@ class pix2pixModel(object):
             print("please upload the shp file at ./shp/TWN_CITY.shp")
             return
 
-        time = file[-16:-4]
-        type = ""
-        for t in ["DR", "DZ", "KD", "WD"]:
-            if t in file:
-                type = t
+        try:
+            time = file[-16:-4]
+            type = ""
+            for t in ["DR", "DZ", "KD", "WD"]:
+                if t in file:
+                    type = t
 
-        dic = {"DR": "ZDR", "DZ": "ZH", "KD": "KDP", "WD": "WISSDOM"}
+            dic = {"DR": "ZDR", "DZ": "ZH", "KD": "KDP", "WD": "WISSDOM"}
 
-        if type == "WD":
-            (img_u, img_v, img_w) = pix2pix_data.SourceToNpy(pix2pix_data.TimeToSourcePath(time, type), type)
-            if img_u is None:
-                print(time, type, "is None")
-                return
-            cmap_wd = mpl.colors.ListedColormap(['blue', 'cornflowerblue', 'cyan', 'lightcyan', 'white',
-                                                 'yellow', 'orange', 'red', 'tab:red', ])
-            level_bound_WD = [-2.5, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 2.5]
-        else:
-            img = pix2pix_data.SourceToNpy(pix2pix_data.TimeToSourcePath(time, type), type)
-            if img is None:
-                print(time, type, "is None")
-                return
-            cmap = mpl.colors.ListedColormap(['white', 'lightcyan', 'cyan', 'cornflowerblue', 'blue',
-                                              'lime', 'limegreen', 'green', 'yellow', 'orange',
-                                              'red', 'tab:red', 'brown', 'fuchsia', 'blueviolet'])
-            levels = 15
-            level_bound = np.linspace(np.min(img), np.max(img), levels)
-            if type == "KD":
-                level_bound = np.linspace(np.min(img), np.max(img) / 10, levels)
-
-        TWN_CITY = gpd.read_file(Path_shp)
-        plt.figure(figsize=(12, 10))
-        for i in range(1, 9):
-            plt.subplot(2, 4, i)
             if type == "WD":
-                x = np.arange(119, 122.801, 0.01)
-                y = np.arange(21, 26.00001, 0.01)
-                x, y = np.meshgrid(x, y)
-                plt.contourf(x, y, img_w[::-1, :, i - 1], level_bound_WD, cmap=cmap_wd)
-                x = np.arange(119, 122.801, .3)
-                y = np.arange(21, 26.00001, .3)
-                x, y = np.meshgrid(x, y)
-                u = img_u[::-1, :, i - 1][::30, ::30]
-                v = img_v[::-1, :, i - 1][::30, ::30]
-                ax = plt.gca()
-                q = ax.quiver(x, y, u, v)
-                TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
-                plt.xlim(119, 122.8)
-                plt.ylim(21, 26)
-                plt.xticks(np.arange(120, 122.8, 2))
-                if i in [1, 5]:
-                    plt.yticks(np.arange(22, 26, 2))
-                else:
-                    plt.yticks([])
+                (img_u, img_v, img_w) = pix2pix_data.SourceToNpy(pix2pix_data.TimeToSourcePath(time, type), type)
+                cmap_wd = mpl.colors.ListedColormap(['blue', 'cornflowerblue', 'cyan', 'lightcyan', 'white',
+                                                     'yellow', 'orange', 'red', 'tab:red', ])
+                level_bound_WD = [-2.5, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 2.5]
             else:
-                x = np.arange(118, 123.51, 0.0125)
-                y = np.arange(20, 27.00001, 0.0125)
-                x, y = np.meshgrid(x, y)
-                plt.contourf(x, y, img[::-1, :, 8 - i], level_bound, cmap=cmap)
-                ax = plt.gca()
-                TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
-                plt.xlim(118, 123.5)
-                plt.ylim(20, 27)
-                plt.xticks(np.arange(119, 123.5, 2))
-                if i in [1, 5]:
-                    plt.yticks(np.arange(21, 27, 2))
+                img = pix2pix_data.SourceToNpy(pix2pix_data.TimeToSourcePath(time, type), type)
+                if img is None:
+                    print(time, type, "is None")
+                    return
+                cmap = mpl.colors.ListedColormap(['white', 'lightcyan', 'cyan', 'cornflowerblue', 'blue',
+                                                  'lime', 'limegreen', 'green', 'yellow', 'orange',
+                                                  'red', 'tab:red', 'brown', 'fuchsia', 'blueviolet'])
+                levels = 15
+                level_bound = np.linspace(np.min(img), np.max(img), levels)
+                if type == "KD":
+                    level_bound = np.linspace(np.min(img), np.max(img) / 10, levels)
+
+            TWN_CITY = gpd.read_file(Path_shp)
+            plt.figure(figsize=(12, 10))
+            for i in range(1, 9):
+                plt.subplot(2, 4, i)
+                if type == "WD":
+                    x = np.arange(119, 122.801, 0.01)
+                    y = np.arange(21, 26.00001, 0.01)
+                    x, y = np.meshgrid(x, y)
+                    plt.contourf(x, y, img_w[::-1, :, i - 1], level_bound_WD, cmap=cmap_wd)
+                    x = np.arange(119, 122.801, .3)
+                    y = np.arange(21, 26.00001, .3)
+                    x, y = np.meshgrid(x, y)
+                    u = img_u[::-1, :, i - 1][::30, ::30]
+                    v = img_v[::-1, :, i - 1][::30, ::30]
+                    ax = plt.gca()
+                    q = ax.quiver(x, y, u, v)
+                    TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
+                    plt.xlim(119, 122.8)
+                    plt.ylim(21, 26)
+                    plt.xticks(np.arange(120, 122.8, 2))
+                    if i in [1, 5]:
+                        plt.yticks(np.arange(22, 26, 2))
+                    else:
+                        plt.yticks([])
                 else:
-                    plt.yticks([])
-            plt.title(str(i * 0.5) + "km ")
-            plt.colorbar()
-        plt.suptitle(dic[type] + " " + time)
-        plt.savefig(doc_pltRadar + "/" + type + ".png")
-        plt.close()
+                    x = np.arange(118, 123.51, 0.0125)
+                    y = np.arange(20, 27.00001, 0.0125)
+                    x, y = np.meshgrid(x, y)
+                    plt.contourf(x, y, img[::-1, :, i - 1], level_bound, cmap=cmap)
+                    ax = plt.gca()
+                    TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
+                    plt.xlim(118, 123.5)
+                    plt.ylim(20, 27)
+                    plt.xticks(np.arange(119, 123.5, 2))
+                    if i in [1, 5]:
+                        plt.yticks(np.arange(21, 27, 2))
+                    else:
+                        plt.yticks([])
+                plt.title(str(i * 0.5) + "km ")
+                plt.colorbar()
+            plt.suptitle(dic[type] + " " + time)
+            plt.savefig(doc_pltRadar + "/" + type + ".png")
+            plt.close()
+        except Exception as e:
+            print(pix2pix_data.errMsg(e))
+            return
 
     def save_model(self):
         if not os.path.exists(Path_Pix2pix):
@@ -731,10 +746,11 @@ class pix2pixModel(object):
             self.discriminator.module.load_state_dict(torch.load(Path_Pix2pix + "/discriminator.pth"))
 
     def predict_point(self, long=120.2420, lat=24.5976, start="2021/05/28 00:00", end="2021/05/31 19:00"):
-        X, Y, timelist = CreateContinuousData(start, end)
         gt_point, p_point = [], []
-        i, j = -int((lat - 21.8875) // 0.0125) - 1, int((long - 120) // 0.0125)  # 座標點
+        a, b, c, d = pix2pix_data.Get_LongLat(Region)
+        i, j = round((c - lat) / 0.0125) - 1, round((long - a) / 0.0125)  # 座標點
         print("predict data: ", end="")
+        X, Y, timelist = CreateContinuousData(start, end)
         predict_data = DataLoader(NNDataset(X, Y, True), batch_size=1, num_workers=1)
         self.load_model(True)
         with torch.no_grad():
@@ -742,16 +758,19 @@ class pix2pixModel(object):
                 output = self.generator(test_x).squeeze(1)
                 for b in range(test_x.shape[0]):
                     p = output[b, :, :].cpu().numpy().reshape(self.opt.img_height, self.opt.img_width)
-                    p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
+                    p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
+                    # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
                     gt = np.load(YName[b])
                     p_point.append(p[i][j])
                     gt_point.append(gt[i][j])
 
         with open(os.path.join(Path_Pix2pix, "predict_%.3f°E_%.3f°N.txt" % (long, lat)), "w") as f:
+            f.writelines("Time              Lat        Long     predict    truth \n")
             for i in range(len(p_point)):
-                value = ("%.2f" % p_point[i]).rjust(9, " ")
+                pvalue = ("%.2f" % p_point[i]).rjust(9, " ")
+                value = ("%.2f" % gt_point[i]).rjust(9, " ")
                 f.writelines("%s  %3.4f   %2.4f" % (datetime.datetime.strftime(timelist[i], "%Y/%m/%d %H:%M"),
-                                                    long, lat) + value + "\n")
+                                                    long, lat) + pvalue + value + "\n")
 
         if len(timelist) < 24 * 4:
             sample_tick = [t for t in timelist if t.hour in [0, 6, 12, 18]]
@@ -800,6 +819,10 @@ def CreateDataSet(opt, WDData=True):
                 Augmentation = False
                 HaveWD = False
                 if TestData:
+                    avg = np.mean(np.load(qpepre + r"/" + pre))
+                    max = np.max(np.load(qpepre + r"/" + pre))
+                    if max < opt.Threshold and avg < opt.Threshold_Avg:
+                        continue
                     if wd in WDList and WDData:
                         X_test_wd.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
                         Y_test_wd.append([qpepre + r"/" + pre, 0])
@@ -940,8 +963,8 @@ def CreateContinuousData(start="2021/05/01 00:00", end="2021/06/01 00:00", WDDat
 
 def op():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--img_height", type=int, default=256, help="size of image height")
-    parser.add_argument("--img_width", type=int, default=192, help="size of image width")
+    parser.add_argument("--img_height", type=int, default=64, help="size of image height")
+    parser.add_argument("--img_width", type=int, default=64, help="size of image width")
     parser.add_argument("--epoch_num", type=int, default=250, help="number of epochs of training")
     parser.add_argument("--lr", type=float, default=0.00001, help="adam: learning rate")
     parser.add_argument("--batch_size_train", type=int, default=7, help="size of the training batches")
