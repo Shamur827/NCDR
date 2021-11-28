@@ -9,13 +9,13 @@ import traceback
 
 warnings.filterwarnings('ignore')
 
-doc = r"E:/ST"
+doc = r"E:/NT"
 SourcePath = doc + r"/RadarData"
 SourcePath = r"D:/Data2"
 Path_QPE = doc + r"/QPE"
 Path_Pix2pix = doc + r"/QPE/pix2pix"
 Path_shp = SourcePath + r"/shp/TWN_CITY.shp"
-Region = "ST"
+Region = "NT"  # NT, ST, RS_TW
 MaxDR, MinDR, MaxDZ, MinDZ, MaxKD, MinKD, MaxPre, MinPre, MaxZ, MinZ = \
     25.496891, 0.0, 110.35679, -30.603172, 39.522815, 0.0, 99.75, 0.0, 10 ** 11.035679, 10 ** -3.0603172
 MaxWD_u, MinWD_u, MaxWD_v, MinWD_v, MaxWD_w, MinWD_w, = \
@@ -30,6 +30,71 @@ def ProcessData(dBZtoZ=True):
             print(msg)
         else:
             np.save(file, arr)
+
+    def ProcessNpy(sourPath, Type, dBZtoZ=True):
+        # 處理npy 和歸一化
+        def ImgToWD(img_u, img_v, img_w):
+            h, w = Get_LongLat(Region, True)
+            img_u = cv2.resize(img_u, (w, h))
+            img_v = cv2.resize(img_v, (w, h))
+            img_w = cv2.resize(img_w, (w, h))
+            img_u = np.where(img_u >= 0, np.log(img_u + 1) / np.log(MaxWD_u + 1),
+                             -np.log(-img_u + 1) / np.log(-MinWD_u + 1))
+            img_v = np.where(img_v >= 0, np.log(img_v + 1) / np.log(MaxWD_v + 1),
+                             -np.log(-img_v + 1) / np.log(-MinWD_v + 1))
+            img_w = np.where(img_w >= 0, np.log(img_w + 1) / np.log(MaxWD_w + 1),
+                             -np.log(-img_w + 1) / np.log(-MinWD_w + 1))
+
+            img = np.zeros((h, w, 48))
+            for i in range(h):
+                for j in range(w):
+                    for k in range(8):
+                        if img_u[i][j][k] >= 0:
+                            img[i][j][k * 6 + 0] = img_u[i][j][k]
+                        else:
+                            img[i][j][k * 6 + 1] = -img_u[i][j][k]
+                        if img_v[i][j][k] >= 0:
+                            img[i][j][k * 6 + 2] = img_v[i][j][k]
+                        else:
+                            img[i][j][k * 6 + 3] = -img_v[i][j][k]
+                        if img_w[i][j][k] >= 0:
+                            img[i][j][k * 6 + 4] = img_w[i][j][k]
+                        else:
+                            img[i][j][k * 6 + 5] = -img_w[i][j][k]
+            return img
+
+        def Preprocess(array, Type):
+            if Type == "KD":
+                array = np.where(array > MaxKD, MaxKD, array)
+
+            # array = cv2.resize(array, (192, 256))
+
+            # dBZ to Z
+            if Type == "Z":
+                array = 10 ** (array / 10)
+                array = np.log(array + 1 - MinZ) / np.log(MaxZ - MinZ + 1)
+            elif Type == "DR":  # DR
+                array = np.log2(array + 1) / np.log2(MaxDR + 1)
+            elif Type == "DZ":  # DZ
+                array = np.log(array + 1 - MinDZ) / np.log(MaxDZ - MinDZ + 1)
+            elif Type == "KD":  # KD
+                array = np.log10(array + 1) / np.log10(MaxKD + 1)
+            return array
+
+        try:
+            if Type == "WD":
+                (img_u, img_v, img_w) = SourceToNpy(sourPath, Type, True)
+                return ImgToWD(img_u, img_v, img_w), ""
+            elif Type in ["DR", "DZ", "KD"]:
+                # dBZ to Z
+                array = SourceToNpy(sourPath, Type, True)
+                if Type == "DZ" and dBZtoZ:
+                    return Preprocess(array, "Z"), ""
+                return Preprocess(array, Type), ""
+            elif Type == "qpepre":
+                return SourceToNpy(sourPath, Type, True), ""
+        except Exception as e:
+            return None, errMsg(e)
 
     if not os.path.exists(Path_shp):
         raise Exception("please upload the shp file at ./shp/TWN_CITY.shp")
@@ -83,7 +148,7 @@ def ProcessData(dBZtoZ=True):
                 # 儲存.npy
                 try:
                     np_save(StorePath + "qpepre/" + file[:-4] + ".npy",
-                            SourceToNpy(os.path.join(dirPath, file), "qpepre"))
+                            ProcessNpy(os.path.join(dirPath, file), "qpepre"))
                 except Exception as e:
                     print(errMsg(e))
 
@@ -146,70 +211,6 @@ def errMsg(e):
     return errMsg
 
 
-def ProcessNpy(sourPath, Type, dBZtoZ=True):
-    # 處理npy 切割區域和歸一化
-    def ImgToWD(img_u, img_v, img_w):
-        w, h = 64, 64
-        img_u = cv2.resize(img_u, (w, h))
-        img_v = cv2.resize(img_v, (w, h))
-        img_w = cv2.resize(img_w, (w, h))
-        img_u = np.where(img_u >= 0, np.log(img_u + 1) / np.log(MaxWD_u + 1),
-                         -np.log(-img_u + 1) / np.log(-MinWD_u + 1))
-        img_v = np.where(img_v >= 0, np.log(img_v + 1) / np.log(MaxWD_v + 1),
-                         -np.log(-img_v + 1) / np.log(-MinWD_v + 1))
-        img_w = np.where(img_w >= 0, np.log(img_w + 1) / np.log(MaxWD_w + 1),
-                         -np.log(-img_w + 1) / np.log(-MinWD_w + 1))
-
-        img = np.zeros((h, w, 48))
-        for i in range(h):
-            for j in range(w):
-                for k in range(8):
-                    if img_u[i][j][k] >= 0:
-                        img[i][j][k * 6 + 0] = img_u[i][j][k]
-                    else:
-                        img[i][j][k * 6 + 1] = -img_u[i][j][k]
-                    if img_v[i][j][k] >= 0:
-                        img[i][j][k * 6 + 2] = img_v[i][j][k]
-                    else:
-                        img[i][j][k * 6 + 3] = -img_v[i][j][k]
-                    if img_w[i][j][k] >= 0:
-                        img[i][j][k * 6 + 4] = img_w[i][j][k]
-                    else:
-                        img[i][j][k * 6 + 5] = -img_w[i][j][k]
-        return img
-
-    def Preprocess(array, Type):
-        if Type == "KD":
-            array = np.where(array > MaxKD, MaxKD, array)
-
-        # array = cv2.resize(array, (192, 256))
-
-        # dBZ to Z
-        if Type == "Z":
-            array = 10 ** (array / 10)
-            array = np.log(array + 1 - MinZ) / np.log(MaxZ - MinZ + 1)
-        elif Type == "DR":  # DR
-            array = np.log2(array + 1) / np.log2(MaxDR + 1)
-        elif Type == "DZ":  # DZ
-            array = np.log(array + 1 - MinDZ) / np.log(MaxDZ - MinDZ + 1)
-        elif Type == "KD":  # KD
-            array = np.log10(array + 1) / np.log10(MaxKD + 1)
-        return array
-
-    try:
-        if Type == "WD":
-            (img_u, img_v, img_w) = SourceToNpy(sourPath, Type)
-            return ImgToWD(img_u, img_v, img_w), ""
-        else:
-            # dBZ to Z
-            array = SourceToNpy(sourPath, Type)
-            if Type == "DZ" and dBZtoZ:
-                return Preprocess(array, "Z"), ""
-            return Preprocess(array, Type), ""
-    except Exception as e:
-        return None, errMsg(e)
-
-
 # 外部引用
 def SourceToNpy(sourPath, Type, Split=False):
     def unpack(sourPath, Type):
@@ -256,15 +257,9 @@ def SourceToNpy(sourPath, Type, Split=False):
         if Type == "WD":
             img_u, img_v, img_w = unpack(sourPath, Type)
             if Split:
-                be_long, be_long2, be_lat, be_lat2 = Get_LongLat("WD")
-                af_long, af_long2, af_lat, af_lat2 = Get_LongLat(Region)
-
-                img_u = img_u[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-                        round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125), :8]
-                img_v = img_v[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-                        round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125), :8]
-                img_w = img_w[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-                        round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125), :8]
+                img_u = SplitRegion(img_u[:, :, :8], "WD", Region)
+                img_v = SplitRegion(img_v[:, :, :8], "WD", Region)
+                img_w = SplitRegion(img_w[:, :, :8], "WD", Region)
             img_u = np.where(img_u == -999, 0, img_u)
             img_v = np.where(img_v == -999, 0, img_v)
             img_w = np.where(img_w == -999, 0, img_w)
@@ -273,11 +268,7 @@ def SourceToNpy(sourPath, Type, Split=False):
         elif Type in ["DR", "DZ", "KD"]:
             array = unpack(sourPath, Type)
             if Split:
-                be_long, be_long2, be_lat, be_lat2 = Get_LongLat("Radar")
-                af_long, af_long2, af_lat, af_lat2 = Get_LongLat(Region)
-
-                array = array[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-                        round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125), :8]
+                array = SplitRegion(array[:, :, :8], "Radar", Region)
             if Type == "DZ":
                 array = np.where(array == -9999, MinDZ, array)
             else:
@@ -287,22 +278,54 @@ def SourceToNpy(sourPath, Type, Split=False):
             array = unpack(sourPath, Type)
             return array
     except Exception as e:
-        raise Exception(errMsg(e))
+        raise Exception(sourPath, ": ", errMsg(e))
 
 
-def Get_LongLat(Type):
-    if Type == "Radar":
-        return 118, 123.5, 20, 27
-    if Type == "WD":
-        return 119, 122.8, 21, 26
-    if Type == "Rain":
-        return 120, 122.0125, 21.8875, 25.3125
-    if Type == "NT":
-        return 122 - 0.0125 * 63, 122, 25.3 - 0.0125 * 63, 25.3
-    if Type == "ST":
-        return 120.1, 120.1 + 0.0125 * 63, 23.1, 23.1 + 0.0125 * 63
+def Get_LongLat(Type, size=False):
+    if size:  # get h, w
+        if Type == "Radar":
+            return 561, 441
+        if Type == "WD":
+            return 501, 381
+        if Type == "TW":
+            return 275, 162
+        if Type == "RS_TW":
+            return 256, 192
+        if Type == "NT":
+            return 64, 64
+        if Type == "ST":
+            return 64, 64
+    else:
+        if Type == "Radar":
+            return 118, 123.5, 20, 27
+        if Type == "WD":
+            return 119, 122.8, 21, 26
+        if Type == "TW":
+            return 120, 122.0125, 21.8875, 25.3125
+        if Type == "RS_TW":
+            return 120, 122.0125, 21.8875, 25.3125
+        if Type == "NT":
+            return 122 - 0.0125 * 63, 122, 25.3 - 0.0125 * 63, 25.3
+        if Type == "ST":
+            return 120.1, 120.1 + 0.0125 * 63, 23.1, 23.1 + 0.0125 * 63
 
     return None
+
+
+def SplitRegion(img, be_region, af_region):
+    if be_region == af_region:
+        return img
+    be_long, be_long2, be_lat, be_lat2 = Get_LongLat(be_region)
+    af_long, af_long2, af_lat, af_lat2 = Get_LongLat(af_region)
+
+    assert be_lat2 > af_lat2
+    assert af_lat > be_lat
+    assert af_long > be_long
+    assert be_long2 > af_long2
+
+    img = img[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
+          round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125)]
+    return img
 
 
 def TimeToSourcePath(h, Type):

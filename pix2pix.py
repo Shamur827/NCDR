@@ -34,8 +34,6 @@ class NNDataset(Dataset):
     def __init__(self, X, Y, GetYFileName=False):
         self.X = X
         self.Y = Y
-        self.w = 192
-        self.h = 256
         self.Path = Path_QPE
         self.GetYFileName = GetYFileName
         print(len(self.Y))
@@ -69,13 +67,6 @@ class NNDataset(Dataset):
             return torch.from_numpy(X_).float(), torch.from_numpy(Y_).float().unsqueeze(0)
 
     def Preprocess(self, array, ci):
-        # print("1:", array.shape)
-        # be_long, be_long2, be_lat, be_lat2 = pix2pix_data.Get_LongLat("Rain")
-        # # ST
-        # af_long, af_long2, af_lat, af_lat2 = pix2pix_data.Get_LongLat("ST")
-        # array = array[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-        #         round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125), :8]
-        # print("2:", array.shape)
         # wissdom_out_Taiwan_mosaic_202105311730.npy
         if ci[-42:-17] == "wissdom_out_Taiwan_mosaic":
             return array[:, :, ::-1]
@@ -85,12 +76,10 @@ class NNDataset(Dataset):
         if not os.path.exists(Y_path):
             return np.zeros(1)
         array = np.load(Y_path)
-        be_long, be_long2, be_lat, be_lat2 = pix2pix_data.Get_LongLat("Rain")
-        # ST
-        af_long, af_long2, af_lat, af_lat2 = pix2pix_data.Get_LongLat(Region)
-        array = array[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-                round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125)]
-        # array = cv2.resize(array, (self.w, self.h))
+        array = pix2pix_data.SplitRegion(array, "TW", Region)
+        if Region == "RS_TW":
+            h, w = pix2pix_data.Get_LongLat(Region, True)
+            array = cv2.resize(array, (w, h))
         array = np.log2(array + 1) / np.log2(pix2pix_data.MaxPre + 1)
         return array
 
@@ -366,7 +355,6 @@ class pix2pixModel(object):
         patch = (1, self.opt.img_height // 2 ** 4, self.opt.img_width // 2 ** 4)
         valid = Variable(Tensor(np.ones((real_A.size(0), *patch))), requires_grad=False)  # torch.Size([2, 1, 16, 12])
         fake = Variable(Tensor(np.zeros((real_A.size(0), *patch))), requires_grad=False)
-
         #  Train Generators
         self.optimizer_G.zero_grad()  # zero the gradient buffers
         # GAN loss
@@ -451,10 +439,7 @@ class pix2pixModel(object):
     def cal_site(self, gt, p):
         threshold = self.threshold
         site = np.load(os.path.join(SourcePath, "site.npy"))
-        be_long, be_long2, be_lat, be_lat2 = pix2pix_data.Get_LongLat("Rain")
-        af_long, af_long2, af_lat, af_lat2 = pix2pix_data.Get_LongLat(Region)
-        site = site[round((be_lat2 - af_lat2) / 0.0125):round((be_lat - af_lat) / 0.0125),
-                round((af_long - be_long) / 0.0125):round((af_long2 - be_long2) / 0.0125)]
+        site = pix2pix_data.SplitRegion(site, "TW", Region)
         gt, p = gt[site == 1], p[site == 1]
 
         mer = 100 * (np.abs(gt - p) / (gt + 1.01)).mean()
@@ -506,6 +491,9 @@ class pix2pixModel(object):
                     p = output[b, :, :].cpu().numpy().reshape(self.opt.img_height, self.opt.img_width)
                     # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
                     p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
+                    if Region == "RS_TW":
+                        h, w = pix2pix_data.Get_LongLat("TW", True)
+                        p = cv2.resize(p, (w, h))
 
                     doc = doc_test + "/" + YName[b][-40:-4]  # qpepre_202105010600-202105010700_1_h
                     if not os.path.exists(doc):
@@ -518,6 +506,7 @@ class pix2pixModel(object):
                     # 存在 label
                     if os.path.exists(YName[b]):
                         gt = np.load(YName[b])
+                        array = pix2pix_data.SplitRegion(array, "TW", Region)
                         self.plt_shp(gt, doc + "/gt" + ".png")
                         mer, csi, log_str, csi_and, csi_or, mse = self.cal(gt, p)
                         with open(doc + "/cal.txt", "w") as f:
@@ -749,6 +738,9 @@ class pix2pixModel(object):
         gt_point, p_point = [], []
         a, b, c, d = pix2pix_data.Get_LongLat(Region)
         i, j = round((c - lat) / 0.0125) - 1, round((long - a) / 0.0125)  # 座標點
+        if i >= self.opt.img_height or j >= self.opt.img_width:
+            print("指定的座標點超出預測範圍")
+            return
         print("predict data: ", end="")
         X, Y, timelist = CreateContinuousData(start, end)
         predict_data = DataLoader(NNDataset(X, Y, True), batch_size=1, num_workers=1)
@@ -760,6 +752,9 @@ class pix2pixModel(object):
                     p = output[b, :, :].cpu().numpy().reshape(self.opt.img_height, self.opt.img_width)
                     p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
                     # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
+                    if Region == "RS_TW":
+                        h, w = pix2pix_data.Get_LongLat("TW", True)
+                        p = cv2.resize(p, (w, h))
                     gt = np.load(YName[b])
                     p_point.append(p[i][j])
                     gt_point.append(gt[i][j])
