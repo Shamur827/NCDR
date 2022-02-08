@@ -14,6 +14,7 @@ from time import time
 from torch.autograd import Variable
 import argparse
 import geopandas as gpd
+from sklearn.metrics import roc_curve, auc  # 計算roc和auc
 import pix2pix_data
 
 seed = 164
@@ -92,6 +93,161 @@ class customLoss(nn.Module):
         return torch.mean((outputs - targets) ** 2 * (targets + 1))
 
 
+# UNet --------------------------------------------------
+class DoubleConv(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
+
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
+
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # input is CHW
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        # if you have padding issues, see
+        # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+        # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet(nn.Module):
+    def __init__(self, n_channels, n_classes, bilinear=True):
+        super(UNet, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+
+        self.inc = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(512, 1024 // factor)
+        self.up1 = Up(1024, 512 // factor, bilinear)
+        self.up2 = Up(512, 256 // factor, bilinear)
+        self.up3 = Up(256, 128 // factor, bilinear)
+        self.up4 = Up(128, 64, bilinear)
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        x = x.permute(0, 3, 1, 2)
+        batch = x.shape[0]
+        channel = x.shape[1]
+        height = x.shape[2]
+        width = x.shape[3]
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        logits = self.outc(x)
+        return logits
+# UNet ＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾
+
+
+class AutoEncoder(nn.Module):
+    def __init__(self, in_channels=24+48):
+        super(AutoEncoder, self).__init__()
+
+        self.in1 = nn.Conv2d(in_channels, 36, 5, 1, 2)
+        self.in2 = nn.Conv2d(36, 18, 5, 1, 2)
+        self.in3 = nn.Conv2d(18, 8, 5, 1, 2)
+        self.in4 = nn.Conv2d(8, 1, 5, 1, 2)
+
+        self.out1 = nn.Conv2d(1, 8, 5, 1, 2)
+        self.out2 = nn.Conv2d(8, 18, 5, 1, 2)
+        self.out3 = nn.Conv2d(18, 36, 5, 1, 2)
+        self.out4 = nn.Conv2d(36, in_channels, 5, 1, 2)
+
+    def forward(self, x):
+        x = x.permute(0, 3, 1, 2)
+        batch = x.shape[0]
+        channel = x.shape[1]
+        height = x.shape[2]
+        width = x.shape[3]
+
+        x = F.relu(self.in1(x))
+        x = F.relu(self.in2(x))
+        x = F.relu(self.in3(x))
+        x = F.relu(self.in4(x))
+
+        hid = x
+
+        x = F.relu(self.out1(x))
+        x = F.relu(self.out2(x))
+        x = F.relu(self.out3(x))
+        x = F.relu(self.out4(x))
+
+        x = x.permute(0, 2, 3, 1)
+        batch = x.shape[0]
+        channel = x.shape[3]
+        height = x.shape[1]
+        width = x.shape[2]
+
+        return x, hid
+
+
+# GAN --------------------------------------------------
 class UNetDown(nn.Module):
     def __init__(self, in_size, out_size, normalize=True, dropout=0.0):
         super(UNetDown, self).__init__()
@@ -184,17 +340,17 @@ class GeneratorUNet(nn.Module):
             x_cat = F.relu(x_cat + x3)
 
         d1 = self.down1(x_cat)  # torch.Size([7, 64, 32, 32])
-        d2 = self.down2(d1)     # torch.Size([7, 128, 16, 16])
-        d3 = self.down3(d2)     # torch.Size([7, 256, 8, 8])
-        d4 = self.down4(d3)     # torch.Size([7, 512, 4, 4])
-        d5 = self.down5(d4)     # torch.Size([7, 512, 2, 2])
-        d6 = self.down6(d5)     # torch.Size([7, 512, 1, 1])
-        u1 = self.up1(d6, d5)   # torch.Size([7, 1024, 2, 2])
-        u2 = self.up2(u1, d4)   # torch.Size([7, 1024, 4, 4])
-        u3 = self.up3(u2, d3)   # torch.Size([7, 512, 8, 8])
-        u4 = self.up4(u3, d2)   # torch.Size([7, 256, 16, 16])
-        u5 = self.up5(u4, d1)   # torch.Size([7, 128, 32, 32])
-        fin = self.final(u5)    # torch.Size([7, 1, 64, 64])
+        d2 = self.down2(d1)  # torch.Size([7, 128, 16, 16])
+        d3 = self.down3(d2)  # torch.Size([7, 256, 8, 8])
+        d4 = self.down4(d3)  # torch.Size([7, 512, 4, 4])
+        d5 = self.down5(d4)  # torch.Size([7, 512, 2, 2])
+        d6 = self.down6(d5)  # torch.Size([7, 512, 1, 1])
+        u1 = self.up1(d6, d5)  # torch.Size([7, 1024, 2, 2])
+        u2 = self.up2(u1, d4)  # torch.Size([7, 1024, 4, 4])
+        u3 = self.up3(u2, d3)  # torch.Size([7, 512, 8, 8])
+        u4 = self.up4(u3, d2)  # torch.Size([7, 256, 16, 16])
+        u5 = self.up5(u4, d1)  # torch.Size([7, 128, 32, 32])
+        fin = self.final(u5)  # torch.Size([7, 1, 64, 64])
 
         return fin
 
@@ -212,13 +368,17 @@ class Discriminator(nn.Module):
             return layers
 
         self.model = nn.Sequential(
-            *discriminator_block(in_channels * 2, 64, normalization=False),
+            # (1, 2, 64, 64)
+            *discriminator_block(1+1, 64, normalization=False),
+            # *discriminator_block(24 + 1, 64, normalization=False),
+            # *discriminator_block(1, 64, normalization=False),
             *discriminator_block(64, 128),
             *discriminator_block(128, 256),
             *discriminator_block(256, 512),
             nn.ZeroPad2d((1, 0, 1, 0)),
             nn.Conv2d(512, 1, 4, padding=1, bias=False),
-            nn.Sigmoid(),
+            # (1, 1, 4, 4)
+            # nn.Sigmoid(),
         )
 
     def forward(self, img_A, img_B):
@@ -226,112 +386,116 @@ class Discriminator(nn.Module):
         img_input = torch.cat((img_A, img_B), 1)
         return self.model(img_input)
 
+        # x = img_A.permute(0, 3, 1, 2)
+        # batch = x.shape[0]
+        # channel = x.shape[1]
+        # height = x.shape[2]
+        # width = x.shape[3]
+        # if channel == 24 + 48:
+        #     x = x[:, :24, :, :]
+        # img_input = torch.cat((x, img_B), 1)
+
+        # img_input = img_B
+        return self.model(img_input)
+# GAN ＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾
+
 
 class pix2pixModel(object):
     def __init__(self, opt):
         self.opt = opt
         self.generator = None
         self.discriminator = None
+        self.autoencoder = None
+        self.unet = None
         self.optimizer_G = None
         self.optimizer_D = None
-        self.lr = opt.lr
+        self.optimizer_A = None
+        self.train_D = True
+        self.lr_G = opt.lr
+        self.lr_D = opt.lr
         self.loss = nn.MSELoss()
-        self.L1loss = nn.MSELoss()
+        self.L1loss = nn.L1Loss()
         self.customLoss = customLoss()
         self.cmap = None
         self.norm = None
         self.bounds = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70]
         self.epoch_num = opt.epoch_num
         self.threshold = opt.CSI_Threshold
+        self.roc_p = None
+        self.roc_gt = None
+        self.highmse = None
+        self.heavymse = None
 
     def train(self, DataLoader_train, DataLoader_val):
         self.load_model(False)
-        self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=self.lr, betas=(0.5, 0.999))
-        self.optimizer_D = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr / 20, betas=(0.5, 0.999))
+        self.load_autoencoder(True)
+        self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=self.lr_G, betas=(0.5, 0.999))
+        self.optimizer_D = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr_D, betas=(0.5, 0.999))
 
-        lessLoss = None
-        count = 0
+        lessLoss_G, lessLoss_D = None, None
+        count_G, count_D = 0, 0
         log_train, log_val = [], []
-        need_frozen_list = ['module.conv_hPA3.weight', 'module.conv_hPA3.bias',
-                            'module.conv_hPA3_2.weight', 'module.conv_hPA3_2.bias',
-                            'module.conv_hPA3_3.weight', 'module.conv_hPA3_3.bias']
+        log_loss_D_train, log_loss_GAN_train, log_loss_D_val, log_loss_GAN_val = [], [], [], []
         for epoch in range(1, self.epoch_num + 1):
             NowTime = time()
-            loss_D_train = 0
-            loss_GAN_train = 0
-            loss_pixel_train = 0
+            loss_D_train, loss_GAN_train, loss_pixel_train = 0, 0, 0
 
             for i, (train_x, train_y) in enumerate(DataLoader_train, 1):
                 self.generator.train()
                 self.discriminator.train()
-                if epoch > 50:
-                    if train_x.shape[3] == 24 + 48:  # frozen
-                        for param in self.generator.named_parameters():
-                            if param[0] not in need_frozen_list:
-                                param[1].requires_grad = False
-                    elif train_x.shape[3] == 24:
-                        for param in self.generator.named_parameters():
-                            param[1].requires_grad = True
-                loss_D, loss_G, loss_pixel, loss_GAN = self.train_step(train_x, train_y.to(device))
+                loss_D, _, loss_pixel, loss_GAN = self.train_step(train_x, train_y)
                 loss_D_train += loss_D
                 loss_GAN_train += loss_GAN
                 loss_pixel_train += loss_pixel
 
             if epoch % 1 == 0:
+                # val --------------------------------------------------
                 self.generator.eval()
                 self.discriminator.eval()
                 with torch.no_grad():
-                    loss_D_val = 0
-                    loss_pixel_val = 0
-                    for i, (real_A, real_B) in enumerate(DataLoader_val):
-                        real_B = real_B.to(device)
-                        Tensor = torch.cuda.FloatTensor
-                        patch = (1, self.opt.img_height // 2 ** 4, self.opt.img_width // 2 ** 4)
-                        valid = Variable(Tensor(np.ones((real_A.size(0), *patch))), requires_grad=False)
-                        fake = Variable(Tensor(np.zeros((real_A.size(0), *patch))), requires_grad=False)
-                        fake_B = self.generator(real_A)
-                        # Pixel-wise loss
-                        loss_pixel = self.customLoss(fake_B, real_B)
-                        loss_G = loss_pixel
+                    loss_D_val, loss_GAN_val, loss_pixel_val, loss_r_f_val = 0, 0, 0, 0
+                    for _, (val_x, val_y) in enumerate(DataLoader_val):
+                        loss_D, loss_r_f, loss_pixel, loss_GAN = self.train_step(val_x, val_y, train=False)
+                        loss_D_val += loss_D
+                        loss_pixel_val += loss_pixel
+                        loss_GAN_val += loss_GAN
+                        loss_r_f_val += loss_r_f
+                # val --------------------------------------------------
 
-                        # Real loss
-                        pred_real = self.discriminator(real_B, real_B)
-                        loss_real = self.L1loss(pred_real, valid)
-                        # Fake loss
-                        pred_fake = self.discriminator(fake_B.detach(), real_B)
-                        loss_fake = self.L1loss(pred_fake, fake)
-                        # Total loss
-                        loss_D = (loss_fake + loss_real) / 2
-
-                        loss_D_val += loss_D.item()
-                        loss_pixel_val += loss_G.item()
-
-                loss_D_train *= 1000
-                loss_GAN_train *= 1000
                 loss_pixel_train *= 1000
-                loss_D_val *= 1000
                 loss_pixel_val *= 1000
                 print(
                     "[Epoch %d, duration=%.2f] [train D loss: %f, GAN loss: %f, pixel loss: %f] "
-                    "[val D loss: %f, pixel loss: %f]"
+                    "[val D loss: %f, GAN loss: %f, pixel loss: %f, real - fake: %f]"
                     % (
                         epoch, (time() - NowTime) / 60,
-                        loss_D_train / len(DataLoader_train),
-                        loss_GAN_train / len(DataLoader_train), loss_pixel_train / len(DataLoader_train),
-                        loss_D_val / len(DataLoader_val), loss_pixel_val / len(DataLoader_val)
+                        loss_D_train / len(DataLoader_train), loss_GAN_train / len(DataLoader_train),
+                        loss_pixel_train / len(DataLoader_train),
+                        loss_D_val / len(DataLoader_val), loss_GAN_val / len(DataLoader_val),
+                        loss_pixel_val / len(DataLoader_val),
+                        loss_r_f_val / len(DataLoader_val)
                     )
                 )
-                if lessLoss is None or loss_pixel_val < lessLoss:
-                    lessLoss = loss_pixel_val
-                    count = 0
+
+                if lessLoss_D is None or loss_D_val < lessLoss_D:
+                    lessLoss_D = loss_D_val
+                    count_D = 0
+                else:
+                    count_D += 1
+
+                if lessLoss_G is None or loss_pixel_val < lessLoss_G:
+                    lessLoss_G = loss_pixel_val
+                    count_G = 0
                     self.save_model()
                 else:
-                    count += 1
-                    if count == 1 or count == 6:
-                        self.lr *= 0.9
-                        print("lr = ", self.lr)
-                        self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=self.lr)
-                        self.optimizer_D = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr / 20)
+                    count_G += 1
+                    # if count_G == 1 or count_G == 6:
+                        # self.lr *= 0.9
+                        # print("lr = ", self.lr)
+                        # self.optimizer_G = torch.optim.Adam(self.generator.parameters(), lr=self.lr)
+                        # self.optimizer_D = torch.optim.Adam(self.discriminator.parameters(), lr=self.lr / 10)
+
+                # 紀錄 loss --------------------------------------------------
                 log_train.append(loss_pixel_train / len(DataLoader_train))
                 log_val.append(loss_pixel_val / len(DataLoader_val))
                 try:
@@ -339,50 +503,237 @@ class pix2pixModel(object):
                     plt.plot(log_val, label="val")
                     plt.legend()
                     plt.xlabel("epoch")
-                    plt.ylim(1.5, 5.5)
-                    plt.ylabel("loss")
+                    ylim_m = int(min(log_train))
+                    plt.ylim(ylim_m, ylim_m+4)
+                    plt.ylabel("loss(10^-3)")
                     plt.grid(linestyle="--", alpha=0.3)
                     plt.savefig(Path_Pix2pix + "/loss.png")
                     plt.close()
                 except:
                     plt.close()
+
+                log_loss_D_train.append(loss_D_train / len(DataLoader_train))
+                log_loss_GAN_train.append(loss_GAN_train / len(DataLoader_train))
+                log_loss_D_val.append(loss_D_val / len(DataLoader_val))
+                log_loss_GAN_val.append(loss_GAN_val / len(DataLoader_val))
+                try:
+                    plt.plot(log_loss_D_train, label="D_Loss_train")
+                    plt.plot(log_loss_GAN_train, label="G_Loss_train")
+                    plt.plot(log_loss_D_val, label="D_Loss_val")
+                    plt.plot(log_loss_GAN_val, label="G_Loss_val")
+                    plt.legend()
+                    plt.xlabel("epoch")
+                    plt.ylabel("loss")
+                    plt.grid(linestyle="--", alpha=0.3)
+                    plt.savefig(Path_Pix2pix + "/loss_gan.png")
+                    plt.close()
+                except:
+                    plt.close()
+                # 紀錄 loss ＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾＾
+
+                if count_G > 10:
+                    print("break epoch = ", epoch)
+                    break
+                # if count_D > 20 and self.train_D:
+                #     self.train_D = False
+                #     print("stop Train Discriminator")
+
+    def trainAuto(self, DataLoader_train, DataLoader_val):
+        self.autoencoder = nn.DataParallel(AutoEncoder().to(device))
+        lr = 0.0025
+        self.optimizer_A = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
+
+        lessLoss = None
+        count = 0
+        log_train, log_val = [], []
+        for epoch in range(1, self.epoch_num + 1):
+            NowTime = time()
+            loss_train = 0
+
+            for i, (train_x, train_y) in enumerate(DataLoader_train, 1):
+                self.autoencoder.train()
+                if train_x.shape[3] == 24 + 48:  # frozen
+                    None
+                elif train_x.shape[3] == 24:
+                    continue
+                self.optimizer_A.zero_grad()
+                x, _ = self.autoencoder(train_x)
+                train_x = train_x.to(device)
+                loss = self.loss(train_x, x)
+                loss.backward()
+                self.optimizer_A.step()
+
+                loss_train += loss.item()
+
+            if epoch % 1 == 0:
+                self.autoencoder.eval()
+                with torch.no_grad():
+                    loss_val = 0
+                    for _, (val_x, val_y) in enumerate(DataLoader_val):
+                        x, _ = self.autoencoder(val_x)
+                        val_x = val_x.to(device)
+                        loss = self.loss(val_x, x)
+                        loss_val += loss.item()
+
+                print(
+                    "[Epoch %d, duration=%.2f] [train loss: %f] "
+                    "[val loss: %f]"
+                    % (
+                        epoch, (time() - NowTime) / 60,
+                        loss_train / len(DataLoader_train), loss_val / len(DataLoader_val)
+                    )
+                )
+                if lessLoss is None or loss_val < lessLoss:
+                    lessLoss = loss_val
+                    count = 0
+                    torch.save(self.autoencoder.module.state_dict(), Path_Pix2pix + "/autoencoder.pth")
+                else:
+                    count += 1
+                    # if count == 1 or count == 6:
+                    #     lr *= 0.9
+                    #     print("lr = ", lr)
+                    #     self.optimizer_A = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
+                # 紀錄 loss
+                log_train.append(loss_train / len(DataLoader_train))
+                log_val.append(loss_val / len(DataLoader_val))
+                plt.plot(log_train, label="train")
+                plt.plot(log_val, label="val")
+                plt.legend()
+                plt.xlabel("epoch")
+                ylim_m = int(min(log_train))
+                # plt.ylim(ylim_m, ylim_m+4)
+                plt.ylabel("loss")
+                plt.grid(linestyle="--", alpha=0.3)
+                plt.savefig(Path_Pix2pix + "/auto_loss.png")
+                plt.close()
+
                 if count > 10:
                     print("break epoch = ", epoch)
                     break
 
-    def train_step(self, real_A: torch.Tensor, real_B: torch.Tensor):
+    def trainUNet(self, DataLoader_train, DataLoader_val):
+        self.unet = nn.DataParallel(UNet(24 + 48, 1).to(device))
+        # self.unet = nn.DataParallel(GeneratorUNet().to(device))
+        lr = 0.0025
+        self.optimizer_A = torch.optim.Adam(self.unet.parameters(), lr=lr)
+        # self.optimizer_A = torch.optim.Adam(self.unet.parameters(), lr=self.lr_G)
+
+        lessLoss = None
+        count = 0
+        log_train, log_val = [], []
+        for epoch in range(1, self.epoch_num + 1):
+            NowTime = time()
+            loss_train = 0
+
+            for i, (train_x, train_y) in enumerate(DataLoader_train, 1):
+                self.unet.train()
+                if train_x.shape[3] == 24 + 48:  # frozen
+                    None
+                elif train_x.shape[3] == 24:
+                    continue
+                self.optimizer_A.zero_grad()
+                outputs = self.unet(train_x)
+                targets = train_y.to(device)
+                loss = self.customLoss(outputs, targets)
+                loss.backward()
+                self.optimizer_A.step()
+
+                loss_train += loss.item()
+
+            if epoch % 1 == 0:
+                self.unet.eval()
+                with torch.no_grad():
+                    loss_val = 0
+                    for _, (val_x, val_y) in enumerate(DataLoader_val):
+                        outputs = self.unet(val_x)
+                        targets = val_y.to(device)
+                        loss = self.customLoss(outputs, targets)
+                        loss_val += loss.item()
+
+                print(
+                    "[Epoch %d, duration=%.2f] [train loss: %f] "
+                    "[val loss: %f]"
+                    % (
+                        epoch, (time() - NowTime) / 60,
+                        loss_train / len(DataLoader_train), loss_val / len(DataLoader_val)
+                    )
+                )
+                if lessLoss is None or loss_val < lessLoss:
+                    lessLoss = loss_val
+                    count = 0
+                    torch.save(self.unet.module.state_dict(), Path_Pix2pix + "/unet.pth")
+                    # torch.save(self.unet.module.state_dict(), Path_Pix2pix + "/generator.pth")
+                else:
+                    count += 1
+                    # if count == 1 or count == 6:
+                    #     lr *= 0.9
+                    #     print("lr = ", lr)
+                    #     self.optimizer_A = torch.optim.Adam(self.autoencoder.parameters(), lr=lr)
+                # 紀錄 loss
+                log_train.append(loss_train / len(DataLoader_train))
+                log_val.append(loss_val / len(DataLoader_val))
+                plt.plot(log_train, label="train")
+                plt.plot(log_val, label="val")
+                plt.legend()
+                plt.xlabel("epoch")
+                ylim_m = int(min(log_train)*1000)/1000
+                plt.ylim(ylim_m, ylim_m+0.004)
+                plt.ylabel("loss")
+                plt.grid(linestyle="--", alpha=0.3)
+                plt.savefig(Path_Pix2pix + "/unet_loss.png")
+                plt.close()
+
+                if count > 10:
+                    print("break epoch = ", epoch)
+                    break
+
+    def train_step(self, real_A: torch.Tensor, real_B: torch.Tensor, train=True):
+        img_B = real_B.numpy()
+        hid = img_B.copy()
+        for i in range(hid.shape[0]):
+            hid[i, 0, :, :] = cv2.medianBlur(img_B[i, 0, :, :], 5)
+        hid = torch.from_numpy(hid).to(device)
+
+        real_B = real_B.to(device)
+        # _, hid = self.autoencoder(real_A)
+        # hid = hid.detach()
         Tensor = torch.cuda.FloatTensor
-        patch = (1, self.opt.img_height // 2 ** 4, self.opt.img_width // 2 ** 4)
+        patch = (1, self.opt.model_h // 2 ** 4, self.opt.model_w // 2 ** 4)
         valid = Variable(Tensor(np.ones((real_A.size(0), *patch))), requires_grad=False)  # torch.Size([2, 1, 16, 12])
-        fake = Variable(Tensor(np.zeros((real_A.size(0), *patch))), requires_grad=False)
+        fake = Variable(Tensor(np.zeros((real_A.size(0), *patch))), requires_grad=False)  # torch.Size([2, 1, 4, 4])
         #  Train Generators
-        self.optimizer_G.zero_grad()  # zero the gradient buffers
+        if train:
+            self.optimizer_G.zero_grad()  # zero the gradient buffers
         # GAN loss
         fake_B = self.generator(real_A)
-        pred_fake = self.discriminator(fake_B, real_B)
+        pred_fake = self.discriminator(hid, fake_B)
         loss_GAN = self.L1loss(pred_fake, valid)
         # Pixel-wise loss
         loss_pixel = self.customLoss(fake_B, real_B)
         weight = 100
         loss_G = loss_GAN + weight * loss_pixel
-        loss_G.backward()
+        if train:
+            loss_G.backward()
+            self.optimizer_G.step()
         # print(self.generator.module.down1.model[0].weight)
-        self.optimizer_G.step()
 
         #  Train Discriminator
-        self.optimizer_D.zero_grad()
+        if train and self.train_D:
+            self.optimizer_D.zero_grad()
         # Real loss
-        pred_real = self.discriminator(real_B, real_B)
+        pred_real = self.discriminator(hid, real_B)
         loss_real = self.L1loss(pred_real, valid)
         # Fake loss
-        pred_fake = self.discriminator(fake_B.detach(), real_B)
+        pred_fake = self.discriminator(hid, fake_B.detach())
         loss_fake = self.L1loss(pred_fake, fake)
         # Total loss
         loss_D = (loss_fake + loss_real) / 2
-        loss_D.backward()
-        self.optimizer_D.step()
+        loss_r_f = loss_real - loss_fake  # 正表示鑑別器傾向低估 => 猜假
+        if train and self.train_D:
+            loss_D.backward()
+            self.optimizer_D.step()
 
-        return loss_D.item(), loss_G.item(), loss_pixel.item(), loss_GAN.item()
+        return loss_D.item(), loss_r_f.item(), loss_pixel.item(), loss_GAN.item()
 
     def pltconfig(self):
         self.cmap = mpl.colors.ListedColormap(['lightcyan', 'cyan', 'cornflowerblue', 'blue',
@@ -411,7 +762,9 @@ class pix2pixModel(object):
         ax = TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
         plt.xlim(long, long2)
         plt.ylim(lat, lat2)
-        plt.xticks(np.arange(120, 122.5, 0.5))
+        plt.xticks(np.linspace(long, long2, 5))
+        if Region == "RS_TW":
+            plt.xticks(np.arange(120, 122.5, 0.5))
         plt.colorbar(
             mpl.cm.ScalarMappable(cmap=self.cmap, norm=norm),
             # cax=ax,
@@ -441,15 +794,20 @@ class pix2pixModel(object):
         site = np.load(os.path.join(SourcePath, "site.npy"))
         site = pix2pix_data.SplitRegion(site, "TW", Region)
         gt, p = gt[site == 1], p[site == 1]
+        self.roc_gt += list(gt)
+        self.roc_p += list(p)
 
         mer = 100 * (np.abs(gt - p) / (gt + 1.01)).mean()
-        csi_and = np.logical_and(gt > threshold, p > threshold).sum()
-        csi_or = np.logical_or(gt > threshold, p > threshold).sum()
-        csi = csi_and / csi_or if csi_or != 0 else None
+        A = np.logical_and(gt > threshold, p > threshold).sum()
+        B = np.logical_and(gt > threshold, p <= threshold).sum()  # 漏報
+        C = np.logical_and(gt <= threshold, p > threshold).sum()  # 誤報
+        csi = A / (A+B+C) if A+B+C != 0 else None
         mse = np.square(np.subtract(gt, p)).mean()
+        self.highmse += list(np.square(np.subtract(gt[gt>5], p[gt>5])))
+        self.heavymse += list(np.square(np.subtract(gt[gt>40], p[gt>40])))
         str = "gt, avg=%.5f, max=%.3f, min=%.3f \np , avg=%.5f, max=%.3f, min=%.3f \n" \
               % (np.mean(gt), np.max(gt), np.min(gt), np.mean(p), np.max(p), np.min(p))
-        return mer, csi, str, csi_and, csi_or, mse
+        return mer, csi, str, mse, A, B, C
 
     def cal(self, gt, p):
         if os.path.exists(os.path.join(SourcePath, "site.npy")):
@@ -457,19 +815,18 @@ class pix2pixModel(object):
 
         threshold = self.threshold
         mer = 100 * (np.abs(gt - p) / (gt + 1.01)).mean()
-        csi_and = np.logical_and(gt > threshold, p > threshold).sum()
-        csi_or = np.logical_or(gt > threshold, p > threshold).sum()
-        csi = csi_and / csi_or if csi_or != 0 else None
+        A = np.logical_and(gt > threshold, p > threshold).sum()
+        B = np.logical_and(gt > threshold, p <= threshold).sum()
+        C = np.logical_and(gt <= threshold, p > threshold).sum()
+        csi = A / (A+B+C) if A+B+C != 0 else None
         mse = np.square(np.subtract(gt, p)).mean()
         str = "gt, avg=%.5f, max=%.3f, min=%.3f \np , avg=%.5f, max=%.3f, min=%.3f \n" \
               % (np.mean(gt), np.max(gt), np.min(gt), np.mean(p), np.max(p), np.min(p))
-        return mer, csi, str, csi_and, csi_or, mse
+        return mer, csi, str, mse, A, B, C
 
     def test(self, DataLoader_test):
         print("pix2pixModel test")
         self.load_model(True)
-        if not os.path.exists(Path_Pix2pix):
-            os.mkdir(Path_Pix2pix)
         doc_test = Path_Pix2pix + "/test" + datetime.datetime.today().strftime("_%m%d_%H%M")
         if not os.path.exists(doc_test):
             os.mkdir(doc_test)
@@ -479,7 +836,8 @@ class pix2pixModel(object):
         with open(doc_test + "/cal.txt", "w") as f:
             f.writelines(Path_Pix2pix + "\n")
         temp_mer, temp_mse, temp_csi, temp_avg, temp_max = [], [], [], [], []
-        sum_csi_and, sum_csi_or, sum_csi_and_avg, sum_csi_or_avg, sum_csi_and_max, sum_csi_or_max = 0, 0, 0, 0, 0, 0
+        self.roc_p, self.roc_gt, self.highmse , self.heavymse= [], [], [], []
+        A, B, C = 0, 0, 0
 
         self.generator.eval()
         with torch.no_grad():
@@ -488,31 +846,33 @@ class pix2pixModel(object):
                 output = self.generator(test_x).squeeze(1)
                 loss_test += self.loss(output, test_y.float().to(device)).item()
                 for b in range(test_x.shape[0]):
-                    p = output[b, :, :].cpu().numpy().reshape(self.opt.img_height, self.opt.img_width)
+                    p = output[b, :, :].cpu().numpy().reshape(self.opt.model_h, self.opt.model_w)
                     # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
                     p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
                     if Region == "RS_TW":
-                        h, w = pix2pix_data.Get_LongLat("TW", True)
-                        p = cv2.resize(p, (w, h))
+                        p = cv2.resize(p, (self.opt.img_w, self.opt.img_h))
 
+                    gt = np.load(YName[b])
+                    gt = pix2pix_data.SplitRegion(gt, "TW", Region)
                     doc = doc_test + "/" + YName[b][-40:-4]  # qpepre_202105010600-202105010700_1_h
-                    if not os.path.exists(doc):
-                        os.mkdir(doc)
-                    self.plt_shp(p, doc + "/p" + ".png")
-                    self.writefile(p, doc + "/QPE_" + YName[b][-40:-4] + ".txt")
-                    if self.opt.pltSource:
-                        for t in X_time:
-                            self.pltRadar(t[0], doc)
                     # 存在 label
                     if os.path.exists(YName[b]):
                         gt = np.load(YName[b])
-                        array = pix2pix_data.SplitRegion(array, "TW", Region)
-                        self.plt_shp(gt, doc + "/gt" + ".png")
-                        mer, csi, log_str, csi_and, csi_or, mse = self.cal(gt, p)
-                        with open(doc + "/cal.txt", "w") as f:
-                            f.writelines("MER=%.5f, MSE=%.3f, " % (mer, mse)
-                                         + ("CSI=NaN\n" if csi is None else ("CSI=%.3f\n" % csi)))
-                            f.writelines(log_str)
+                        gt = pix2pix_data.SplitRegion(gt, "TW", Region)
+                        mer, csi, log_str, mse, cal_a, cal_b, cal_c = self.cal(gt, p)
+                        if mse < 30 and np.max(gt) > 80:
+                            if not os.path.exists(doc):
+                                os.mkdir(doc)
+                            self.plt_shp(p, doc + "/p" + ".png")
+                            self.writefile(p, doc + "/QPE_" + YName[b][-40:-4] + ".txt")
+                            if self.opt.pltSource:
+                                for t in X_time:
+                                    self.pltRadar(t[0], doc)
+                            self.plt_shp(gt, doc + "/gt" + ".png")
+                            with open(doc + "/cal.txt", "w") as f:
+                                f.writelines("MER=%.5f, MSE=%.3f, " % (mer, mse)
+                                             + ("CSI=NaN\n" if csi is None else ("CSI=%.3f\n" % csi)))
+                                f.writelines(log_str)
 
                         max_gt, mean_gt = np.max(gt), np.mean(gt)
                         temp_mer.append(mer)
@@ -520,24 +880,20 @@ class pix2pixModel(object):
                         temp_csi.append(csi)
                         temp_avg.append(mean_gt)
                         temp_max.append(max_gt)
-                        sum_csi_and += csi_and
-                        sum_csi_or += csi_or
-                        if max_gt >= 40:
-                            sum_csi_and_max += csi_and
-                            sum_csi_or_max += csi_or
-                        if mean_gt > 1:
-                            sum_csi_and_avg += csi_and
-                            sum_csi_or_avg += csi_or
+                        A += cal_a
+                        B += cal_b
+                        C += cal_c
 
                         with open(doc_test + "/cal.txt", "a") as f:
                             cal_log = "%s : MER=%.5f, MSE=%.3f, " % (YName[b][-40:-4], mer, mse) \
                                       + ("CSI=NaN" if csi is None else ("CSI=%.3f" % csi))
-                            print(cal_log)
+                            # print(cal_log)
                             f.writelines(cal_log + "\n")
                             f.writelines(log_str)
         if len(temp_mer) == 0:
             return
         loss_test *= 1000
+
         # print("DataLoader_test: ", loss_test / len(DataLoader_test))
 
         def avg_(list, label):
@@ -546,34 +902,32 @@ class pix2pixModel(object):
             return label + "=%.3f" % (sum(list) / len(list))
 
         with open(doc_test + "/cal.txt", "a") as f:
-            if sum_csi_or == 0:
-                sum_csi_or = 1
-            if sum_csi_or_max == 0:
-                sum_csi_or_max = 1
-            if sum_csi_or_avg == 0:
-                sum_csi_or_avg = 1
-            f.writelines("Sum : MER=%.5f, CSI=%.3f, MSE=%.3f  \n" %
-                         (sum(temp_mer) / len(temp_mer), sum_csi_and / sum_csi_or, sum(temp_mse) / len(temp_mse)))
-            f.writelines("topcsi_avg=%.3f, topcsi_max=%.3f \n" % (sum_csi_and_avg / sum_csi_or_avg,
-                                                                  sum_csi_and_max / sum_csi_or_max))
+            CSI = A/(A+B+C) if A+B+C != 0 else 0
+            POD = A/(A+B) if A+B != 0 else 0
+            FAR = C/(A+C) if A+C != 0 else 0
+            f.writelines("Sum : MER=%.5f, CSI=%.3f, POD=%.3f, FAR=%.3f, MSE=%.3f, hMSE=%.3f, HMSE=%.3f  \n" %
+                         (sum(temp_mer) / len(temp_mer), CSI, POD, FAR, sum(temp_mse) / len(temp_mse),
+                          sum(self.highmse) / len(self.highmse), sum(self.heavymse) / len(self.heavymse)))
+            # f.writelines("topcsi_avg=%.3f, topcsi_max=%.3f \n" % (sum_csi_and_avg / sum_csi_or_avg,
+            #                                                       sum_csi_and_max / sum_csi_or_max))
             topmer_avg = list(
                 filter(lambda x: list(map(lambda te: float(te) > 1, temp_avg))[temp_mer.index(x)] is True, temp_mer))
             topmer_max = list(
                 filter(lambda x: list(map(lambda te: int(te) >= 40, temp_max))[temp_mer.index(x)] is True, temp_mer))
-            # f.writelines("topmer_avg=%.3f, topmer_max=%.3f \n" % (sum(topmer_avg) / len(topmer_avg),
-            #                                                       sum(topmer_max) / len(topmer_max)))
             f.writelines(avg_(topmer_avg, "topmer_avg") + ", " + avg_(topmer_max, "topmer_max") + " \n")
             topmse_avg = list(
                 filter(lambda x: list(map(lambda te: float(te) > 1, temp_avg))[temp_mse.index(x)] is True, temp_mse))
             topmse_max = list(
                 filter(lambda x: list(map(lambda te: int(te) >= 40, temp_max))[temp_mse.index(x)] is True, temp_mse))
-            # f.writelines("topmse_avg=%.3f, topmse_max=%.3f \n" % (sum(topmse_avg) / len(topmse_avg),
-            #                                                       sum(topmse_max) / len(topmse_max)))
             f.writelines(avg_(topmse_avg, "topmse_avg") + ", " + avg_(topmse_max, "topmse_max") + " \n")
 
         print("Mean error rate = %.5f " % (sum(temp_mer) / len(temp_mer)) + "%")
-        print("Critical Success Index = %.5f " % (sum_csi_and / sum_csi_or))
+        print("Critical Success Index = %.5f " % CSI)
+        print("Probability of Detection = %.5f " % POD)
+        print("False Alarm Ratio = %.5f " % FAR)
         print("Mean square error = %.5f " % (sum(temp_mse) / len(temp_mse)))
+        print("High Mean square error = %.5f " % (sum(self.highmse) / len(self.highmse)))
+        print("Heavy Mean square error = %.5f " % (sum(self.heavymse) / len(self.heavymse)))
 
         # 繪圖
         plt.hist(temp_mer)
@@ -634,6 +988,215 @@ class pix2pixModel(object):
         plt.grid(linestyle="--", alpha=0.3)
         plt.savefig(doc_test + "/max_mse.png")
         plt.close()
+
+        if len(self.roc_p) != 0:
+            try:
+                print(len(self.roc_gt), len(self.roc_p))
+                fpr, tpr, threshold = roc_curve(self.roc_gt, self.roc_p)  # 計算真正率和假正率
+                roc_auc = auc(fpr, tpr)  # 計算auc的值
+                plt.figure()
+                lw = 2
+                # plt.figure(figsize=(10, 10))
+                plt.plot(fpr, tpr, color='darkorange',
+                         lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)  # 假正率為橫座標，真正率為縱座標做曲線
+                plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+                plt.xlim([0.0, 1.01])
+                plt.ylim([0.0, 1.01])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title('Receiver operating characteristic')
+                plt.legend(loc="lower right")
+                plt.savefig(doc_test + "/roc.png")
+                plt.close()
+            except Exception as e:
+                print(pix2pix_data.errMsg(e))
+
+    def testUnet(self, DataLoader_test):
+        print("testUnet test")
+        self.load_unet(True)
+        doc_test = Path_Pix2pix + "/test" + datetime.datetime.today().strftime("_%m%d_%H%M")
+        if not os.path.exists(doc_test):
+            os.mkdir(doc_test)
+        self.pltconfig()
+        if os.path.exists(os.path.join(SourcePath, "site.npy")):
+            print("test by site.npy")
+        with open(doc_test + "/cal.txt", "w") as f:
+            f.writelines(Path_Pix2pix + "\n")
+        temp_mer, temp_mse, temp_csi, temp_avg, temp_max = [], [], [], [], []
+        self.roc_p, self.roc_gt = [], []
+        A, B, C = 0, 0, 0
+
+        self.unet.eval()
+        with torch.no_grad():
+            loss_test = 0
+            for _, (test_x, test_y, X_time, YName) in enumerate(DataLoader_test):
+                output = self.unet(test_x).squeeze(1)
+                loss_test += self.loss(output, test_y.float().to(device)).item()
+                for b in range(test_x.shape[0]):
+                    p = output[b, :, :].cpu().numpy().reshape(self.opt.model_h, self.opt.model_w)
+                    # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
+                    p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
+                    if Region == "RS_TW":
+                        p = cv2.resize(p, (self.opt.img_w, self.opt.img_h))
+
+                    gt = np.load(YName[b])
+                    gt = pix2pix_data.SplitRegion(gt, "TW", Region)
+                    doc = doc_test + "/" + YName[b][-40:-4]  # qpepre_202105010600-202105010700_1_h
+                    # 存在 label
+                    if os.path.exists(YName[b]):
+                        gt = np.load(YName[b])
+                        gt = pix2pix_data.SplitRegion(gt, "TW", Region)
+                        mer, csi, log_str, mse, cal_a, cal_b, cal_c = self.cal(gt, p)
+                        if mse < 30 and np.max(gt) > 80:
+                            if not os.path.exists(doc):
+                                os.mkdir(doc)
+                            self.plt_shp(p, doc + "/p" + ".png")
+                            self.writefile(p, doc + "/QPE_" + YName[b][-40:-4] + ".txt")
+                            if self.opt.pltSource:
+                                for t in X_time:
+                                    self.pltRadar(t[0], doc)
+                            self.plt_shp(gt, doc + "/gt" + ".png")
+                            with open(doc + "/cal.txt", "w") as f:
+                                f.writelines("MER=%.5f, MSE=%.3f, " % (mer, mse)
+                                             + ("CSI=NaN\n" if csi is None else ("CSI=%.3f\n" % csi)))
+                                f.writelines(log_str)
+
+                        max_gt, mean_gt = np.max(gt), np.mean(gt)
+                        temp_mer.append(mer)
+                        temp_mse.append(mse)
+                        temp_csi.append(csi)
+                        temp_avg.append(mean_gt)
+                        temp_max.append(max_gt)
+                        A += cal_a
+                        B += cal_b
+                        C += cal_c
+
+                        with open(doc_test + "/cal.txt", "a") as f:
+                            cal_log = "%s : MER=%.5f, MSE=%.3f, " % (YName[b][-40:-4], mer, mse) \
+                                      + ("CSI=NaN" if csi is None else ("CSI=%.3f" % csi))
+                            # print(cal_log)
+                            f.writelines(cal_log + "\n")
+                            f.writelines(log_str)
+        if len(temp_mer) == 0:
+            return
+        loss_test *= 1000
+
+        # print("DataLoader_test: ", loss_test / len(DataLoader_test))
+
+        def avg_(list, label):
+            if len(list) == 0:
+                return label + "=NaN"
+            return label + "=%.3f" % (sum(list) / len(list))
+
+        with open(doc_test + "/cal.txt", "a") as f:
+            CSI = A/(A+B+C) if A+B+C != 0 else 0
+            POD = A/(A+B) if A+B != 0 else 0
+            FAR = C/(A+C) if A+C != 0 else 0
+            f.writelines("Sum : MER=%.5f, CSI=%.3f, POD=%.3f, FAR=%.3f, MSE=%.3f, hMSE=%.3f, HMSE=%.3f  \n" %
+                         (sum(temp_mer) / len(temp_mer), CSI, POD, FAR, sum(temp_mse) / len(temp_mse),
+                          sum(self.highmse) / len(self.highmse), sum(self.heavymse) / len(self.heavymse)))
+            # f.writelines("topcsi_avg=%.3f, topcsi_max=%.3f \n" % (sum_csi_and_avg / sum_csi_or_avg,
+            #                                                       sum_csi_and_max / sum_csi_or_max))
+            topmer_avg = list(
+                filter(lambda x: list(map(lambda te: float(te) > 1, temp_avg))[temp_mer.index(x)] is True, temp_mer))
+            topmer_max = list(
+                filter(lambda x: list(map(lambda te: int(te) >= 40, temp_max))[temp_mer.index(x)] is True, temp_mer))
+            f.writelines(avg_(topmer_avg, "topmer_avg") + ", " + avg_(topmer_max, "topmer_max") + " \n")
+            topmse_avg = list(
+                filter(lambda x: list(map(lambda te: float(te) > 1, temp_avg))[temp_mse.index(x)] is True, temp_mse))
+            topmse_max = list(
+                filter(lambda x: list(map(lambda te: int(te) >= 40, temp_max))[temp_mse.index(x)] is True, temp_mse))
+            f.writelines(avg_(topmse_avg, "topmse_avg") + ", " + avg_(topmse_max, "topmse_max") + " \n")
+
+        print("Mean error rate = %.5f " % (sum(temp_mer) / len(temp_mer)) + "%")
+        print("Critical Success Index = %.5f " % CSI)
+        print("Probability of Detection = %.5f " % POD)
+        print("False Alarm Ratio = %.5f " % FAR)
+        print("Mean square error = %.5f " % (sum(temp_mse) / len(temp_mse)))
+        print("High Mean square error = %.5f " % (sum(self.highmse) / len(self.highmse)))
+        print("Heavy Mean square error = %.5f " % (sum(self.heavymse) / len(self.heavymse)))
+
+        # 繪圖
+        plt.hist(temp_mer)
+        plt.xlabel("Mean error rate (%)")
+        plt.ylabel("Count")
+        plt.savefig(doc_test + "/mer.png")
+        plt.close()
+
+        temp_csi_noNone = [csi for csi in temp_csi if csi is not None]
+        plt.hist(temp_csi_noNone)
+        plt.xlabel("Critical Success Index")
+        plt.ylabel("Count")
+        plt.savefig(doc_test + "/csi.png")
+        plt.close()
+
+        # avg_csi = list(
+        #     filter(lambda x: list(map(lambda csi: csi is not None, temp_csi))[temp_avg.index(x)] is True, temp_avg))
+        # plt.scatter(avg_csi, temp_csi_noNone, s=30, c='blue', marker='s',
+        #             alpha=0.9, linewidths=0.3, edgecolors='red')
+        # plt.xlabel('Average rain fall (mm/hr)')
+        # plt.ylabel('Critical Success Index')
+        # plt.savefig(doc_test + "/avg_csi.png")
+        # plt.close()
+
+        # max_csi = list(
+        #     filter(lambda x: list(map(lambda csi: csi is not None, temp_csi))[temp_max.index(x)] is True, temp_max))
+        # plt.scatter(max_csi, temp_csi_noNone, s=30, c='blue', marker='s',
+        #             alpha=0.9, linewidths=0.3, edgecolors='red')
+        # plt.xlabel('Maximum rain fall (mm/hr)')
+        # plt.ylabel('Critical Success Index')
+        # plt.savefig(doc_test + "/max_csi.png")
+        # plt.close()
+
+        plt.scatter(temp_avg, temp_mer, s=30, c='blue', marker='s', alpha=0.9, linewidths=0.3, edgecolors='red')
+        plt.xlabel('Average rain fall (mm/hr)')
+        plt.ylabel('Mean error rate (%)')
+        plt.grid(linestyle="--", alpha=0.3)
+        plt.savefig(doc_test + "/avg_mer.png")
+        plt.close()
+
+        plt.scatter(temp_max, temp_mer, s=30, c='blue', marker='s', alpha=0.9, linewidths=0.3, edgecolors='red')
+        plt.xlabel('Maximum rain fall (mm/hr)')
+        plt.ylabel('Mean error rate (%)')
+        plt.grid(linestyle="--", alpha=0.3)
+        plt.savefig(doc_test + "/max_mer.png")
+        plt.close()
+
+        plt.scatter(temp_avg, temp_mse, s=30, c='blue', marker='s', alpha=0.9, linewidths=0.3, edgecolors='red')
+        plt.xlabel('Average rain fall (mm/hr)')
+        plt.ylabel('Mean square error')
+        plt.grid(linestyle="--", alpha=0.3)
+        plt.savefig(doc_test + "/avg_mse.png")
+        plt.close()
+
+        plt.scatter(temp_max, temp_mse, s=30, c='blue', marker='s', alpha=0.9, linewidths=0.3, edgecolors='red')
+        plt.xlabel('Maximum rain fall (mm/hr)')
+        plt.ylabel('Mean square error')
+        plt.grid(linestyle="--", alpha=0.3)
+        plt.savefig(doc_test + "/max_mse.png")
+        plt.close()
+
+        if len(self.roc_p) != 0:
+            try:
+                print(len(self.roc_gt), len(self.roc_p))
+                fpr, tpr, threshold = roc_curve(self.roc_gt, self.roc_p)  # 計算真正率和假正率
+                roc_auc = auc(fpr, tpr)  # 計算auc的值
+                plt.figure()
+                lw = 2
+                # plt.figure(figsize=(10, 10))
+                plt.plot(fpr, tpr, color='darkorange',
+                         lw=lw, label='ROC curve (area = %0.2f)' % roc_auc)  # 假正率為橫座標，真正率為縱座標做曲線
+                plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+                plt.xlim([0.0, 1.01])
+                plt.ylim([0.0, 1.01])
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title('Receiver operating characteristic')
+                plt.legend(loc="lower right")
+                plt.savefig(doc_test + "/roc.png")
+                plt.close()
+            except Exception as e:
+                print(pix2pix_data.errMsg(e))
 
     def pltRadar(self, file, doc_pltRadar=""):
         if not os.path.exists(Path_shp):
@@ -727,40 +1290,110 @@ class pix2pixModel(object):
             except:
                 print('saving failed')
 
-    def load_model(self, exist):
+    def load_model(self, exist, model_path=None):
         self.generator = nn.DataParallel(GeneratorUNet().to(device))
+        # self.generator = nn.DataParallel(UNet(24 + 48, 1).to(device))
         self.discriminator = nn.DataParallel(Discriminator().to(device))
-        if exist and os.path.exists(Path_Pix2pix):
-            self.generator.module.load_state_dict(torch.load(Path_Pix2pix + "/generator.pth"))
-            self.discriminator.module.load_state_dict(torch.load(Path_Pix2pix + "/discriminator.pth"))
+        load_path = Path_Pix2pix if model_path is None else model_path + r"/QPE/pix2pix"
+        if exist and os.path.exists(load_path):
+            print("load model at " + load_path + "/generator.pth")
+            self.generator.module.load_state_dict(torch.load(load_path + "/generator.pth"))
+            print("load model at " + load_path + "/discriminator.pth")
+            self.discriminator.module.load_state_dict(torch.load(load_path + "/discriminator.pth"))
+            return True
+        return False
+
+    def load_autoencoder(self, exist, model_path=None):
+        self.autoencoder = nn.DataParallel(AutoEncoder().to(device))
+        load_path = Path_Pix2pix if model_path is None else model_path + r"/QPE/pix2pix"
+        if exist and os.path.exists(load_path):
+            print("load model at " + load_path + "/autoencoder.pth")
+            self.autoencoder.module.load_state_dict(torch.load(load_path + "/autoencoder.pth"))
+            return True
+        return False
+
+    def load_unet(self, exist, model_path=None):
+        self.unet = nn.DataParallel(UNet(24 + 48, 1).to(device))
+        load_path = Path_Pix2pix if model_path is None else model_path + r"/QPE/pix2pix"
+        if exist and os.path.exists(load_path):
+            print("load model at " + load_path + "/unet.pth")
+            self.unet.module.load_state_dict(torch.load(load_path + "/unet.pth"))
+            return True
+        return False
 
     def predict_point(self, long=120.2420, lat=24.5976, start="2021/05/28 00:00", end="2021/05/31 19:00"):
-        gt_point, p_point = [], []
-        a, b, c, d = pix2pix_data.Get_LongLat(Region)
-        i, j = round((c - lat) / 0.0125) - 1, round((long - a) / 0.0125)  # 座標點
-        if i >= self.opt.img_height or j >= self.opt.img_width:
-            print("指定的座標點超出預測範圍")
-            return
-        print("predict data: ", end="")
         X, Y, timelist = CreateContinuousData(start, end)
-        predict_data = DataLoader(NNDataset(X, Y, True), batch_size=1, num_workers=1)
-        self.load_model(True)
-        with torch.no_grad():
-            for _, (test_x, _, _, YName) in enumerate(predict_data):
-                output = self.generator(test_x).squeeze(1)
-                for b in range(test_x.shape[0]):
-                    p = output[b, :, :].cpu().numpy().reshape(self.opt.img_height, self.opt.img_width)
-                    p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
-                    # p = cv2.resize(2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
-                    if Region == "RS_TW":
-                        h, w = pix2pix_data.Get_LongLat("TW", True)
-                        p = cv2.resize(p, (w, h))
-                    gt = np.load(YName[b])
-                    p_point.append(p[i][j])
-                    gt_point.append(gt[i][j])
+
+        TWN_CITY = gpd.read_file(pix2pix_data.Path_shp)
+        ax = plt.gca()
+        plt.scatter(long, lat, s=20, c='r', marker="*")
+        TWN_CITY.geometry.plot(ax=ax, alpha=0.3)
+        x1, x2, y1, y2 = pix2pix_data.Get_LongLat(Region)
+        plt.xlim(x1, x2)
+        plt.ylim(y1, y2)
+        plt.savefig(os.path.join(Path_Pix2pix, "%.3f°E_%.3f°N.png" % (long, lat)))
+        plt.close()
+
+        gt_point = []
+        a, _, c, _ = pix2pix_data.Get_LongLat("TW")
+        i, j = round((c - lat) / 0.0125) - 1, round((long - a) / 0.0125)  # 座標點 ex:-50, 56
+        for y in Y:
+            gt = np.load(y[0])
+            gt_point.append(gt[i][j])
+
+        def Get_predict(model_path, lat, long, region, X, Y):
+            # region : NT, ST, RS_TW
+            point = []
+            if self.load_model(True, model_path):
+                a, _, c, _ = pix2pix_data.Get_LongLat(region)
+                model_h, model_w = pix2pix_data.Get_LongLat(region, size=True)
+                img_h, img_w = pix2pix_data.Get_LongLat(region, size=True)
+                if region == "RS_TW":
+                    img_h, img_w = pix2pix_data.Get_LongLat("TW", size=True)
+                i, j = round((c - lat) / 0.0125) - 1, round((long - a) / 0.0125)  # 座標點 ex:-50, 56
+                if -i >= img_h or j >= img_w:
+                    print(i, j, img_h, img_w, "指定的座標點超出預測範圍")
+                    return
+                print(X[2][2])
+                print("predict data: ", end="")
+                predict_data = DataLoader(NNDataset(X, Y, True), batch_size=1, num_workers=1)
+                with torch.no_grad():
+                    for _, (test_x, _, _, YName) in enumerate(predict_data):
+                        output = self.generator(test_x).squeeze(1)
+                        for b in range(test_x.shape[0]):
+                            p = output[b, :, :].cpu().numpy().reshape(model_h, model_w)
+                            # print(np.max(p), end=" ")
+                            p = 2 ** (p * np.log2(pix2pix_data.MaxPre + 1)) - 1
+                            if region == "RS_TW":
+                                p = cv2.resize(p, (img_w, img_h))
+                            point.append(p[i][j])
+                            # print(p[i][j])
+            return point
+
+        # 全台部分
+        # if self.load_model(True, r"E:/TWCC"):
+        #     a, b, c, d = pix2pix_data.Get_LongLat("RS_TW")
+        #     i, j = round((c - lat) / 0.0125) - 1, round((long - a) / 0.0125)  # 座標點
+        #     X_tw = [[path.replace("/" + Region + "/", "/TWCC/") for path in data] for data in X]
+        #     print(X_tw[2][2])
+        #     print("predict data: ", end="")
+        #     predict_data = DataLoader(NNDataset(X_tw, Y, True), batch_size=1, num_workers=1)
+        #     with torch.no_grad():
+        #         for _, (test_x, _, _, _) in enumerate(predict_data):
+        #             output = self.generator(test_x).squeeze(1)
+        #             for b in range(test_x.shape[0]):
+        #                 p2 = output[b, :, :].cpu().numpy().reshape(256, 192)
+        #                 print(np.max(p2), end=" ")
+        #                 p2 = 2 ** (p2 * np.log2(pix2pix_data.MaxPre + 1)) - 1
+        #                 p2 = cv2.resize(2 ** (p2 * np.log2(pix2pix_data.MaxPre + 1)) - 1, (162, 275))
+        #                 p_tw_point.append(p2[i][j])
+        #                 print(p2[i][j])
+        p_point = Get_predict(r"E:/" + Region, lat, long, Region, X, Y)
+        X_tw = [[path.replace("/" + Region + "/", "/TWCC/") for path in data] for data in X]
+        p_tw_point = Get_predict(r"E:/TWCC", lat, long, "RS_TW", X_tw, Y)
 
         with open(os.path.join(Path_Pix2pix, "predict_%.3f°E_%.3f°N.txt" % (long, lat)), "w") as f:
-            f.writelines("Time              Lat        Long     predict    truth \n")
+            f.writelines("Time              Lat        Long     predict    Observation \n")
             for i in range(len(p_point)):
                 pvalue = ("%.2f" % p_point[i]).rjust(9, " ")
                 value = ("%.2f" % gt_point[i]).rjust(9, " ")
@@ -776,18 +1409,63 @@ class pix2pixModel(object):
             tick = [t + " 00:00" for t in [datetime.datetime.strftime(t, "%Y/%m/%d") for t in sample_tick]]
             tick_label = [datetime.datetime.strftime(t, "%m/%d") for t in sample_tick]
         plotlist = [datetime.datetime.strftime(t, "%Y/%m/%d %H:%M") for t in timelist]
-        plt.plot(plotlist, gt_point, label="gt")
-        plt.plot(plotlist, p_point, label="p")
+        plt.bar(plotlist, gt_point, color='cornflowerblue', label="Observation", alpha=0.75)
+        plt.plot(plotlist, p_point, color='r', marker='.', label=pix2pix_data.Region, fillstyle='none')
+        plt.plot(plotlist, p_tw_point, color='g', marker='.', label="Taiwan", fillstyle='none')
         plt.xticks(tick, tick_label)
         plt.xlabel(start + " ~ " + end)
         plt.ylabel("mm/hr")
         plt.legend()
-        plt.title("%.3f°E %.3f°N" % (long, lat))
+        plt.title("%s %.3f°E %.3f°N" % (pix2pix_data.Region, long, lat))
         plt.grid(linestyle="--", alpha=0.3)
         plt.savefig(os.path.join(Path_Pix2pix, "predict_%.3f°E_%.3f°N.png" % (long, lat)))
 
 
-def CreateDataSet(opt, WDData=True):
+def CreateDataSet(opt):
+    # qpepre_202005010000-202005010100_1_h
+    # CAPPI_COMP_DZ_202005010000 DR KD
+    # wissdom_out_Taiwan_mosaic_202105020030
+    qpepre, DR, DZ, KD, WD = Path_QPE + r"/qpepre", Path_QPE + r"/DR", Path_QPE + r"/Z", Path_QPE + r"/KD", Path_QPE + r"/WD"
+    X_train, X_test, Y_train, Y_test, X_val, Y_val = [], [], [], [], [], []
+    preList, DRList, DZList, KDList, WDList = os.listdir(qpepre), os.listdir(DR), os.listdir(DZ), os.listdir(
+        KD), os.listdir(WD)
+
+    for pre in preList:
+        b, e = pre[7:19], pre[20:32]
+        b_datatime = datetime.datetime.strptime(b, "%Y%m%d%H%M")
+        if b_datatime.year != 2021:
+            continue
+        TestData = b_datatime.month == 5
+        if TestData and b[-2:] != "00":
+            continue  # 測試資料只拿整點
+        h = datetime.datetime.strftime(datetime.datetime.strptime(b, "%Y%m%d%H%M")
+                                       + datetime.timedelta(minutes=30), "%Y%m%d%H%M")
+        dr, dz, kd, wd = pix2pix_data.BindName(h, ".npy")
+        if dr in DRList and dz in DZList and kd in KDList and wd in WDList:
+            Augmentation = False
+            if TestData:
+                X_test.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
+                Y_test.append([qpepre + r"/" + pre, 0])
+            else:
+                avg = np.mean(np.load(qpepre + r"/" + pre))
+                max = np.max(np.load(qpepre + r"/" + pre))
+                if max < opt.Threshold and avg < opt.Threshold_Avg:
+                    continue
+                if opt.DataAugmentation and max > opt.AugmentationThreshold:
+                    Augmentation = True
+                for i in range(4) if Augmentation else range(1):
+                    X_train.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
+                    Y_train.append([qpepre + r"/" + pre, i])
+
+    # print("X_train = ", len(X_train), ", X_train_wd = ", len(X_train_wd))
+    # print("X_test = ", len(X_test), ", X_test_wd = ", len(X_test_wd))
+    # spilt
+    X_train, X_val, Y_train, Y_val = train_test_split(X_train, Y_train, train_size=opt.train_size, random_state=0)
+
+    return X_train, Y_train, X_test, Y_test, X_val, Y_val
+
+
+def oldCreateDataSet(opt, WDData=True):
     # qpepre_202005010000-202005010100_1_h
     # CAPPI_COMP_DZ_202005010000 DR KD
     # wissdom_out_Taiwan_mosaic_202105020030
@@ -800,45 +1478,41 @@ def CreateDataSet(opt, WDData=True):
 
     TestList = [i.strip() for i in opt.TestData.split(",")]
     for pre in preList:
-        b = pre[7:19]
-        # hourlist = [b[:-2] + "00", b[:-2] + "10", b[:-2] + "20", b[:-2] + "30", b[:-2] + "40", b[:-2] + "50"]
-        hourlist = [b[:-2] + "30"]
+        b, e = pre[7:19], pre[20:32]
         TestData = False
         for t in TestList:
             if b[:len(t)] == t:
                 TestData = True
-                hourlist = [b[:-2] + "30"]
-        for h in hourlist:
-            dr, dz, kd, wd = pix2pix_data.BindName(h, ".npy")
-            if dr in DRList and dz in DZList and kd in KDList:
-                Augmentation = False
-                HaveWD = False
-                if TestData:
-                    avg = np.mean(np.load(qpepre + r"/" + pre))
-                    max = np.max(np.load(qpepre + r"/" + pre))
-                    if max < opt.Threshold and avg < opt.Threshold_Avg:
-                        continue
-                    if wd in WDList and WDData:
-                        X_test_wd.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
-                        Y_test_wd.append([qpepre + r"/" + pre, 0])
-                    else:
-                        X_test.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd])
-                        Y_test.append([qpepre + r"/" + pre, 0])
+        if TestData and b[-2:] != "00":
+            continue  # 測試資料只拿整點
+        h = datetime.datetime.strftime(datetime.datetime.strptime(b, "%Y%m%d%H%M")
+                                       + datetime.timedelta(minutes=30), "%Y%m%d%H%M")
+        dr, dz, kd, wd = pix2pix_data.BindName(h, ".npy")
+        if dr in DRList and dz in DZList and kd in KDList:
+            Augmentation = False
+            HaveWD = False
+            if TestData:
+                if wd in WDList and WDData:
+                    X_test_wd.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
+                    Y_test_wd.append([qpepre + r"/" + pre, 0])
                 else:
-                    avg = np.mean(np.load(qpepre + r"/" + pre))
-                    max = np.max(np.load(qpepre + r"/" + pre))
-                    if max < opt.Threshold and avg < opt.Threshold_Avg:
-                        continue
-                    if opt.DataAugmentation and max > opt.AugmentationThreshold:
-                        Augmentation = True
-                    if wd in WDList:
-                        HaveWD = True
-                    for i in range(4) if Augmentation else range(1):
-                        if HaveWD and WDData:
-                            X_train_wd.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
-                            Y_train_wd.append([qpepre + r"/" + pre, i])
-                        X_train.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd])
-                        Y_train.append([qpepre + r"/" + pre, i])
+                    X_test.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd])
+                    Y_test.append([qpepre + r"/" + pre, 0])
+            else:
+                avg = np.mean(np.load(qpepre + r"/" + pre))
+                max = np.max(np.load(qpepre + r"/" + pre))
+                if max < opt.Threshold and avg < opt.Threshold_Avg:
+                    continue
+                if opt.DataAugmentation and max > opt.AugmentationThreshold:
+                    Augmentation = True
+                if wd in WDList:
+                    HaveWD = True
+                for i in range(4) if Augmentation else range(1):
+                    if HaveWD and WDData:
+                        X_train_wd.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd, WD + r"/" + wd])
+                        Y_train_wd.append([qpepre + r"/" + pre, i])
+                    X_train.append([DR + r"/" + dr, DZ + r"/" + dz, KD + r"/" + kd])
+                    Y_train.append([qpepre + r"/" + pre, i])
 
     # print("X_train = ", len(X_train), ", X_train_wd = ", len(X_train_wd))
     # print("X_test = ", len(X_test), ", X_test_wd = ", len(X_test_wd))
@@ -958,19 +1632,21 @@ def CreateContinuousData(start="2021/05/01 00:00", end="2021/06/01 00:00", WDDat
 
 def op():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--img_height", type=int, default=64, help="size of image height")
-    parser.add_argument("--img_width", type=int, default=64, help="size of image width")
+    parser.add_argument("--model_h", type=int, default=64, help="size of model height")
+    parser.add_argument("--model_w", type=int, default=64, help="size of model width")
+    parser.add_argument("--img_h", type=int, default=64, help="size of really image height")
+    parser.add_argument("--img_w", type=int, default=64, help="size of really image width")
     parser.add_argument("--epoch_num", type=int, default=250, help="number of epochs of training")
     parser.add_argument("--lr", type=float, default=0.00001, help="adam: learning rate")
-    parser.add_argument("--batch_size_train", type=int, default=7, help="size of the training batches")
-    parser.add_argument("--batch_size_val", type=int, default=7, help="size of the val batches")
+    parser.add_argument("--batch_size_train", type=int, default=12, help="size of the training batches")
+    parser.add_argument("--batch_size_val", type=int, default=4, help="size of the val batches")
     parser.add_argument("--batch_size_test", type=int, default=1, help="size of the test batches")
     parser.add_argument("--train_size", type=float, default=0.85, help="size of the training data")
-    parser.add_argument("--DataAugmentation", type=bool, default=True, help="whether use the Data Augmentation")
+    parser.add_argument("--DataAugmentation", type=bool, default=False, help="whether use the Data Augmentation")
     parser.add_argument("--AugmentationThreshold", type=int, default=70, help="")
-    parser.add_argument("--Threshold", type=int, default=15, help="")
+    parser.add_argument("--Threshold", type=int, default=-1, help="")
     parser.add_argument("--Threshold_Avg", type=int, default=90, help="")
-    parser.add_argument("--CSI_Threshold", type=int, default=10, help="")
+    parser.add_argument("--CSI_Threshold", type=int, default=5, help="")
     parser.add_argument("--Train", type=int, default=1, help="1 is Train, 0 is Test")
     parser.add_argument("--TestData", type=str, default="202105", help="")
     parser.add_argument("--pltSource", type=bool, default=False, help="")
@@ -979,25 +1655,32 @@ def op():
 
 def main():
     pix2pix_data.ProcessData()
-    print("start **********************************************************************************")
+    print(pix2pix_data.Region + " start *************************************************************")
     opt = op()
+    opt.model_h, opt.model_w = pix2pix_data.Get_LongLat(Region, size=True)
+    opt.img_h, opt.img_w = pix2pix_data.Get_LongLat(Region, size=True)
+    if Region == "RS_TW":
+        opt.img_h, opt.img_w = pix2pix_data.Get_LongLat("TW", size=True)
     model = pix2pixModel(opt)
-    # model.predict_point(long=120.2420, lat=24.5976, start="2021/05/28 00:00", end="2021/05/31 19:00")
+    # model.predict_point(121.9153, 25.1308, start="2021/05/28 12:00", end="2021/05/31 12:00")
+    # return
+
+    X_train, Y_train, X_test, Y_test, X_val, Y_val = CreateDataSet(opt)
 
     if opt.Train == 1:
-        X_train, Y_train, X_test, Y_test, X_val, Y_val = CreateDataSet(opt)
         print("train data: ", end="")
         DataLoader_train = DataLoader(NNDataset(X_train, Y_train), batch_size=opt.batch_size_train, num_workers=4)
         print("val data: ", end="")
         DataLoader_val = DataLoader(NNDataset(X_val, Y_val), batch_size=opt.batch_size_val, num_workers=4)
+        # model.trainAuto(DataLoader_train, DataLoader_val)
+        # model.trainUNet(DataLoader_train, DataLoader_val)
         model.train(DataLoader_train, DataLoader_val)
-    elif opt.Train == 0:
-        X_test, Y_test = CreateTestData(opt)
-    else:
-        return
     print("test data: ", end="")
     DataLoader_test = DataLoader(NNDataset(X_test, Y_test, True), batch_size=opt.batch_size_test, num_workers=1)
+    # model.testUnet(DataLoader_test)
     model.test(DataLoader_test)
+
+    # model.predict_point(121.9153, 25.1308, start="2021/05/29 12:00", end="2021/05/31 12:00")
 
     print("finish")
 
